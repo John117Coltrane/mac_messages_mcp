@@ -1,272 +1,809 @@
 #!/usr/bin/env python3
 """
-Mac Messages MCP - Entry point fixed for proper MCP protocol implementation
+Mac Messages MCP - Scoped to a single allowed group chat.
+
+Configuration is loaded from config.json in the project root, with env var overrides:
+  - ALLOWED_CHAT_ID: The chat_identifier to lock to (required)
+  - MCP_TRANSPORT: "stdio" or "sse" (default: "stdio")
+  - CHUNK_SIZE_BYTES: Chunk size for attachment transfers (default: 524288)
+
+Run `tool_list_chats` to discover chat identifiers, then set allowed_chat_id in config.json.
+See config.example.json for the format.
 """
 
 import asyncio
+import base64
+import json
 import logging
+import mimetypes
+import os
 import sys
+import tempfile
+import threading
+import uuid as _uuid
 
+import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.routing import Mount, Route
 
 from mac_messages_mcp.messages import (
-    _check_imessage_availability,
-    check_addressbook_access,
     check_messages_db_access,
-    find_contact_by_name,
-    fuzzy_search_messages,
-    get_cached_contacts,
-    get_recent_messages,
+    extract_body_from_attributed,
+    get_chat_mapping,
+    get_contact_name,
     query_messages_db,
+    run_applescript,
     send_message,
 )
 
 # Configure logging to stderr for debugging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    stream=sys.stderr
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stderr,
 )
 
 logger = logging.getLogger("mac_messages_mcp")
 
-# Initialize the MCP server
-mcp = FastMCP("MessageBridge", description="A bridge for interacting with macOS Messages app")
+# ── Config ───────────────────────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    """Load config.json from project root, falling back to env vars / defaults."""
+    config = {}
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            logger.info(f"Loaded config from {config_path}")
+        except Exception as e:
+            logger.warning(f"Failed to read {config_path}: {e}")
+
+    return {
+        "allowed_chat_id": os.environ.get("ALLOWED_CHAT_ID", config.get("allowed_chat_id", "")),
+        "transport": os.environ.get("MCP_TRANSPORT", config.get("transport", "stdio")),
+        "host": os.environ.get("MCP_HOST", config.get("host", "0.0.0.0")),
+        "port": int(os.environ.get("MCP_PORT", config.get("port", 8000))),
+    }
+
+CONFIG = _load_config()
+ALLOWED_CHAT_ID = CONFIG["allowed_chat_id"]
+
+if not ALLOWED_CHAT_ID:
+    logger.error(
+        "No allowed_chat_id configured. Set it in config.json or the ALLOWED_CHAT_ID env var. "
+        "Run tool_list_chats to discover available chat identifiers."
+    )
+
+
+def _get_local_ip() -> str:
+    """Get the LAN IP address of this machine."""
+    import socket
+    try:
+        # Connect to a public DNS to determine which interface is used
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _get_chat_guid(chat_identifier: str) -> str:
+    """Resolve a chat_identifier to the guid that AppleScript needs."""
+    results = query_messages_db(
+        "SELECT guid FROM chat WHERE chat_identifier = ?", (chat_identifier,)
+    )
+    if results and "error" not in results[0]:
+        return results[0]["guid"]
+    return chat_identifier
+
+
+# ── MCP Server ───────────────────────────────────────────────────────────────
+
+mcp = FastMCP(
+    "MessageBridge",
+    description="A bridge for interacting with a single allowed iMessage group chat",
+)
+
 
 @mcp.tool()
-def tool_get_recent_messages(ctx: Context, hours: int = 24, contact: str = None) -> str:
+def tool_list_chats(ctx: Context) -> str:
     """
-    Get recent messages from the Messages app.
-    
+    List all named group chats from the Messages app.
+
+    Use this to find the chat_identifier to put in config.json.
+    """
+    logger.info("Listing available chats")
+    try:
+        query = "SELECT chat_identifier, display_name FROM chat WHERE display_name IS NOT NULL AND display_name != ''"
+        results = query_messages_db(query)
+        if not results:
+            return "No named group chats found."
+        if "error" in results[0]:
+            return f"Error: {results[0]['error']}"
+        lines = []
+        for i, r in enumerate(results, 1):
+            active = " (ACTIVE)" if r["chat_identifier"] == ALLOWED_CHAT_ID else ""
+            lines.append(f"{i}. {r['display_name']} -> {r['chat_identifier']}{active}")
+        return "Available group chats:\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error listing chats: {str(e)}"
+
+
+def _require_allowed_chat() -> str | None:
+    """Return an error string if no chat is configured, else None."""
+    if not ALLOWED_CHAT_ID:
+        return (
+            "Error: No allowed_chat_id configured. "
+            "Use tool_list_chats to find your chat identifier, "
+            "then set it in config.json or the ALLOWED_CHAT_ID env var."
+        )
+    return None
+
+
+# ── Shared message formatting ────────────────────────────────────────────────
+
+# Track the last-seen Apple timestamp for tool_get_new_messages
+_last_seen_timestamp: str = "0"
+
+TAPBACK_TYPES = {
+    2000: "❤️", 2001: "👍", 2002: "👎",
+    2003: "😂", 2004: "‼️", 2005: "❓", 2006: "emoji",
+}
+
+
+def _apple_ts_to_str(apple_timestamp: int) -> str:
+    """Convert an Apple epoch timestamp to a local timezone string."""
+    from datetime import datetime, timezone as tz
+
+    try:
+        apple_epoch_unix = 978307200  # 2001-01-01 00:00:00 UTC in unix seconds
+        if apple_timestamp > 1_000_000_000_000:  # nanoseconds
+            unix_ts = apple_epoch_unix + apple_timestamp / 1_000_000_000
+        else:
+            unix_ts = apple_epoch_unix + apple_timestamp
+        dt = datetime.fromtimestamp(unix_ts).astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except (ValueError, TypeError, OverflowError, OSError):
+        return "Unknown date"
+
+
+def _format_messages(messages: list[dict]) -> str:
+    """Format a list of raw message rows into a display string.
+
+    Separates tapbacks, annotates reactions/flags/attachments,
+    and returns messages in chronological (earliest-first) order.
+    """
+    if not messages:
+        return "No messages found."
+    if "error" in messages[0]:
+        return f"Error accessing messages: {messages[0]['error']}"
+
+    # Separate tapbacks from regular messages
+    regular_messages = []
+    tapback_map: dict = {}
+    for msg in messages:
+        assoc_type = msg.get("associated_message_type") or 0
+        assoc_guid = msg.get("associated_message_guid") or ""
+        if 2000 <= assoc_type <= 2006 and assoc_guid:
+            target_guid = assoc_guid.split("/", 1)[-1] if "/" in assoc_guid else assoc_guid
+            emoji = TAPBACK_TYPES.get(assoc_type, "?")
+            if assoc_type == 2006:
+                emoji = msg.get("associated_message_emoji") or "emoji"
+            sender = "You" if msg["is_from_me"] else get_contact_name(msg["handle_id"])
+            tapback_map.setdefault(target_guid, []).append(f"{emoji} {sender}")
+        else:
+            regular_messages.append(msg)
+
+    # Sort chronologically (earliest first)
+    regular_messages.sort(key=lambda m: m.get("date", 0))
+
+    # Build attachment lookup
+    msg_ids = [str(m["ROWID"]) for m in regular_messages]
+    attachment_map: dict = {}
+    if msg_ids:
+        placeholders = ", ".join(["?" for _ in msg_ids])
+        att_query = f"""
+        SELECT maj.message_id, a.ROWID as att_id, a.transfer_name, a.mime_type, a.total_bytes
+        FROM attachment a
+        JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
+        WHERE maj.message_id IN ({placeholders})
+        """
+        att_results = query_messages_db(att_query, tuple(msg_ids))
+        if att_results and "error" not in att_results[0]:
+            for att in att_results:
+                attachment_map.setdefault(att["message_id"], []).append(att)
+
+    chat_mapping = get_chat_mapping()
+    formatted = []
+    for msg in regular_messages:
+        body = msg.get("text") or ""
+        if not body and msg.get("attributedBody"):
+            body = extract_body_from_attributed(msg["attributedBody"]) or ""
+
+        attachments = attachment_map.get(msg["ROWID"], [])
+        if not body and not attachments:
+            continue
+
+        date_str = _apple_ts_to_str(int(msg["date"]))
+        direction = "You" if msg["is_from_me"] else get_contact_name(msg["handle_id"])
+        group_chat_name = chat_mapping.get(msg.get("cache_roomnames"), "Group Chat")
+
+        line = f"[{date_str}] [msg_id={msg['ROWID']}] [{group_chat_name}] {direction}: {body}"
+
+        flags = []
+        if msg.get("date_edited"):
+            flags.append("EDITED")
+        if msg.get("date_retracted"):
+            flags.append("UNSENT")
+        if msg.get("thread_originator_guid"):
+            flags.append("REPLY")
+        if flags:
+            line += f" [{', '.join(flags)}]"
+
+        reactions = tapback_map.get(msg.get("guid", ""), [])
+        if reactions:
+            line += f" [REACTIONS: {', '.join(reactions)}]"
+
+        if attachments:
+            att_parts = []
+            for att in attachments:
+                name = att.get("transfer_name", "unknown")
+                mime = att.get("mime_type", "unknown")
+                size = att.get("total_bytes", 0)
+                att_parts.append(f"{name} ({mime}, {size} bytes, att_id={att['att_id']})")
+            line += f" [ATTACHMENTS: {'; '.join(att_parts)}]"
+        formatted.append(line)
+
+    if not formatted:
+        return "No messages found."
+    return "\n".join(formatted)
+
+
+_MESSAGE_COLUMNS = """
+    m.ROWID, m.guid, m.date, m.text, m.attributedBody,
+    m.is_from_me, m.handle_id, m.cache_roomnames,
+    m.associated_message_guid, m.associated_message_type,
+    m.associated_message_emoji,
+    m.thread_originator_guid, m.date_edited, m.date_retracted
+"""
+
+
+def _apple_timestamp_for_hours_ago(hours: int) -> str:
+    """Return an Apple-epoch nanosecond timestamp string for N hours ago."""
+    from datetime import datetime, timedelta, timezone as tz
+
+    current_time = datetime.now(tz.utc)
+    hours_ago = current_time - timedelta(hours=hours)
+    apple_epoch = datetime(2001, 1, 1, tzinfo=tz.utc)
+    ns = int((hours_ago - apple_epoch).total_seconds() * 1_000_000_000)
+    return str(ns)
+
+
+# ── Message tools ────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def tool_get_recent_messages(ctx: Context, hours: int = 24) -> str:
+    """
+    Get recent messages from the allowed group chat, in chronological order.
+
     Args:
         hours: Number of hours to look back (default: 24)
-        contact: Filter by contact name, phone number, or email (optional)
-                Use "contact:N" to select a specific contact from previous matches
     """
-    logger.info(f"Getting recent messages: hours={hours}, contact={contact}")
+    if err := _require_allowed_chat():
+        return err
+
+    logger.info(f"Getting recent messages from allowed chat: hours={hours}")
     try:
-        # Handle contacts that are passed as numbers
-        if contact is not None:
-            contact = str(contact)
-        result = get_recent_messages(hours=hours, contact=contact)
-        return result
+        if hours < 0:
+            return "Error: Hours cannot be negative."
+        MAX_HOURS = 10 * 365 * 24
+        if hours > MAX_HOURS:
+            return f"Error: Hours value too large. Maximum allowed is {MAX_HOURS} hours."
+
+        timestamp_str = _apple_timestamp_for_hours_ago(hours)
+
+        query = f"""
+        SELECT {_MESSAGE_COLUMNS}
+        FROM message m
+        WHERE CAST(m.date AS TEXT) > ?
+          AND m.cache_roomnames = ?
+        ORDER BY m.date DESC
+        LIMIT 100
+        """
+        messages = query_messages_db(query, (timestamp_str, ALLOWED_CHAT_ID))
+        return _format_messages(messages)
     except Exception as e:
         logger.error(f"Error in get_recent_messages: {str(e)}")
         return f"Error getting messages: {str(e)}"
 
+
 @mcp.tool()
-def tool_send_message(ctx: Context, recipient: str, message: str, group_chat: bool = False) -> str:
+def tool_get_new_messages(ctx: Context) -> str:
     """
-    Send a message using the Messages app.
-    
-    Args:
-        recipient: Phone number, email, contact name, or "contact:N" to select from matches.
-                  For example, "contact:1" selects the first contact from a previous search.
-                  For group chats, use the chat ID from tool_get_chats (e.g., "chat123456789" or "iMessage;-;chat123456789").
-        message: Message text to send
-        group_chat: Set to True when sending to a group chat. Uses the chat ID directly without contact lookup.
+    Get only new messages since the last check, in chronological order.
+
+    On the first call, returns messages from the last 1 hour.
+    On subsequent calls, returns only messages received after the previous call.
     """
-    logger.info(f"Sending message to: {recipient}, group_chat: {group_chat}")
+    global _last_seen_timestamp
+    if err := _require_allowed_chat():
+        return err
+
+    logger.info(f"Getting new messages since timestamp {_last_seen_timestamp}")
     try:
-        # Ensure recipient is a string (handles numbers properly)
-        recipient = str(recipient)
-        result = send_message(recipient=recipient, message=message, group_chat=group_chat)
+        # On first call, use 1 hour ago as the starting point
+        if _last_seen_timestamp == "0":
+            _last_seen_timestamp = _apple_timestamp_for_hours_ago(1)
+
+        query = f"""
+        SELECT {_MESSAGE_COLUMNS}
+        FROM message m
+        WHERE CAST(m.date AS TEXT) > ?
+          AND m.cache_roomnames = ?
+        ORDER BY m.date DESC
+        LIMIT 100
+        """
+        messages = query_messages_db(query, (_last_seen_timestamp, ALLOWED_CHAT_ID))
+
+        if not messages or "error" in messages[0]:
+            return _format_messages(messages)
+
+        # Update the high-water mark to the newest message's timestamp
+        max_ts = max(int(m["date"]) for m in messages)
+        _last_seen_timestamp = str(max_ts)
+
+        return _format_messages(messages)
+    except Exception as e:
+        logger.error(f"Error in get_new_messages: {str(e)}")
+        return f"Error getting new messages: {str(e)}"
+
+
+@mcp.tool()
+def tool_send_message(ctx: Context, message: str) -> str:
+    """
+    Send a message to the allowed group chat.
+
+    Args:
+        message: Message text to send
+    """
+    if err := _require_allowed_chat():
+        return err
+
+    logger.info(f"Sending message to allowed chat {ALLOWED_CHAT_ID}")
+    try:
+        chat_guid = _get_chat_guid(ALLOWED_CHAT_ID)
+        result = send_message(recipient=chat_guid, message=message, group_chat=True)
         return result
     except Exception as e:
         logger.error(f"Error in send_message: {str(e)}")
         return f"Error sending message: {str(e)}"
 
-@mcp.tool()
-def tool_find_contact(ctx: Context, name: str) -> str:
-    """
-    Find a contact by name using fuzzy matching.
-    
-    Args:
-        name: The name to search for
-    """
-    logger.info(f"Finding contact: {name}")
-    try:
-        matches = find_contact_by_name(name)
-        
-        if not matches:
-            return f"No contacts found matching '{name}'."
-        
-        if len(matches) == 1:
-            contact = matches[0]
-            return f"Found contact: {contact['name']} ({contact['phone']}) with confidence {contact['score']:.2f}"
-        else:
-            # Format multiple matches
-            result = [f"Found {len(matches)} contacts matching '{name}':"]
-            for i, contact in enumerate(matches[:10]):  # Limit to top 10
-                result.append(f"{i+1}. {contact['name']} ({contact['phone']}) - confidence {contact['score']:.2f}")
-            
-            if len(matches) > 10:
-                result.append(f"...and {len(matches) - 10} more.")
-            
-            return "\n".join(result)
-    except Exception as e:
-        logger.error(f"Error in find_contact: {str(e)}")
-        return f"Error finding contact: {str(e)}"
-
-@mcp.tool()
-def tool_check_db_access(ctx: Context) -> str:
-    """
-    Diagnose database access issues.
-    """
-    logger.info("Checking database access")
-    try:
-        return check_messages_db_access()
-    except Exception as e:
-        logger.error(f"Error checking database access: {str(e)}")
-        return f"Error checking database access: {str(e)}"
-
-@mcp.tool()
-def tool_check_contacts(ctx: Context) -> str:
-    """
-    List available contacts in the address book.
-    """
-    logger.info("Checking available contacts")
-    try:
-        contacts = get_cached_contacts()
-        if not contacts:
-            return "No contacts found in AddressBook."
-        
-        contact_count = len(contacts)
-        sample_entries = list(contacts.items())[:10]  # Show first 10 contacts
-        formatted_samples = [f"{number} -> {name}" for number, name in sample_entries]
-        
-        result = [
-            f"Found {contact_count} contacts in AddressBook.",
-            "Sample entries (first 10):",
-            *formatted_samples
-        ]
-        
-        return "\n".join(result)
-    except Exception as e:
-        logger.error(f"Error checking contacts: {str(e)}")
-        return f"Error checking contacts: {str(e)}"
-
-@mcp.tool()
-def tool_check_addressbook(ctx: Context) -> str:
-    """
-    Diagnose AddressBook access issues.
-    """
-    logger.info("Checking AddressBook access")
-    try:
-        return check_addressbook_access()
-    except Exception as e:
-        logger.error(f"Error checking AddressBook: {str(e)}")
-        return f"Error checking AddressBook: {str(e)}"
-
-@mcp.tool()
-def tool_get_chats(ctx: Context) -> str:
-    """
-    List available group chats from the Messages app.
-    """
-    logger.info("Getting available chats")
-    try:
-        query = "SELECT chat_identifier, display_name FROM chat WHERE display_name IS NOT NULL"
-        results = query_messages_db(query)
-        
-        if not results:
-            return "No group chats found."
-        
-        if "error" in results[0]:
-            return f"Error accessing chats: {results[0]['error']}"
-        
-        # Filter out chats without display names and format the results
-        chats = [r for r in results if r.get('display_name')]
-        
-        if not chats:
-            return "No named group chats found."
-        
-        formatted_chats = []
-        for i, chat in enumerate(chats, 1):
-            formatted_chats.append(f"{i}. {chat['display_name']} (ID: {chat['chat_identifier']})")
-        
-        return "Available group chats:\n" + "\n".join(formatted_chats)
-    except Exception as e:
-        logger.error(f"Error getting chats: {str(e)}")
-        return f"Error getting chats: {str(e)}"
-
-
-@mcp.tool()
-def tool_check_imessage_availability(ctx: Context, recipient: str) -> str:
-    """
-    Check if a recipient has iMessage available.
-    
-    This tool helps determine whether to send via iMessage or SMS/RCS.
-    Useful for debugging delivery issues or choosing the right service.
-    
-    Args:
-        recipient: Phone number or email to check for iMessage availability
-    """
-    logger.info(f"Checking iMessage availability for: {recipient}")
-    try:
-        recipient = str(recipient)
-        has_imessage = _check_imessage_availability(recipient)
-        
-        if has_imessage:
-            return f"✅ {recipient} has iMessage available - messages will be sent via iMessage"
-        else:
-            # Check if it looks like a phone number for SMS fallback
-            if any(c.isdigit() for c in recipient):
-                return f"📱 {recipient} does not have iMessage - messages will automatically fall back to SMS/RCS"
-            else:
-                return f"❌ {recipient} does not have iMessage and SMS is not available for email addresses"
-    except Exception as e:
-        logger.error(f"Error checking iMessage availability: {str(e)}")
-        return f"Error checking iMessage availability: {str(e)}"
 
 @mcp.tool()
 def tool_fuzzy_search_messages(
     ctx: Context, search_term: str, hours: int = 24, threshold: float = 0.6
 ) -> str:
     """
-    Fuzzy search for messages containing the search_term within the last N hours.
-    Returns messages that match the search term with a similarity score.
+    Fuzzy search for messages in the allowed group chat.
 
     Args:
         search_term: The text to search for in messages.
-        hours: How many hours back to search (default 24). Must be positive.
-        threshold: Similarity threshold for matching (0.0 to 1.0, default 0.6). Lower is more lenient.
+        hours: How many hours back to search (default 24).
+        threshold: Similarity threshold (0.0-1.0, default 0.6).
     """
+    if err := _require_allowed_chat():
+        return err
+
     if not (0.0 <= threshold <= 1.0):
         return "Error: Threshold must be between 0.0 and 1.0."
     if hours <= 0:
         return "Error: Hours must be a positive integer."
 
-    logger.info(
-        f"Tool: Fuzzy searching messages for '{search_term}' in last {hours} hours with threshold {threshold}"
-    )
+    logger.info(f"Fuzzy searching allowed chat for '{search_term}' in last {hours} hours")
     try:
-        result = fuzzy_search_messages(
-            search_term=search_term, hours=hours, threshold=threshold
-        )
-        return result
+        from datetime import datetime, timedelta, timezone
+
+        from thefuzz import fuzz
+
+        MAX_HOURS = 10 * 365 * 24
+        if hours > MAX_HOURS:
+            return f"Error: Hours value too large. Maximum is {MAX_HOURS} hours."
+
+        current_time = datetime.now(timezone.utc)
+        hours_ago_dt = current_time - timedelta(hours=hours)
+        apple_epoch = datetime(2001, 1, 1, tzinfo=timezone.utc)
+        seconds_since_apple_epoch = (hours_ago_dt - apple_epoch).total_seconds()
+        nanoseconds_since_apple_epoch = int(seconds_since_apple_epoch * 1_000_000_000)
+        timestamp_str = str(nanoseconds_since_apple_epoch)
+
+        query = """
+        SELECT
+            m.ROWID, m.date, m.text, m.attributedBody,
+            m.is_from_me, m.handle_id, m.cache_roomnames
+        FROM message m
+        WHERE CAST(m.date AS TEXT) > ?
+          AND m.cache_roomnames = ?
+        ORDER BY m.date DESC
+        LIMIT 500
+        """
+        messages = query_messages_db(query, (timestamp_str, ALLOWED_CHAT_ID))
+
+        if not messages:
+            return "No messages found in the specified time period."
+        if "error" in messages[0]:
+            return f"Error: {messages[0]['error']}"
+
+        chat_mapping = get_chat_mapping()
+        matched_messages = []
+        int_threshold = int(threshold * 100)
+
+        for msg in messages:
+            if msg.get("text"):
+                body = msg["text"]
+            elif msg.get("attributedBody"):
+                body = extract_body_from_attributed(msg["attributedBody"])
+                if not body:
+                    continue
+            else:
+                continue
+
+            score = fuzz.WRatio(search_term.lower(), body.lower())
+            if score >= int_threshold:
+                try:
+                    date_string = "2001-01-01"
+                    mod_date = datetime.strptime(date_string, "%Y-%m-%d")
+                    unix_timestamp = int(mod_date.timestamp()) * 1000000000
+                    msg_timestamp = int(msg["date"])
+                    if len(str(msg_timestamp)) > 10:
+                        new_date = int((msg_timestamp + unix_timestamp) / 1000000000)
+                    else:
+                        new_date = mod_date.timestamp() + msg_timestamp
+                    date_str = datetime.fromtimestamp(new_date).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                except (ValueError, TypeError, OverflowError):
+                    date_str = "Unknown date"
+
+                direction = (
+                    "You" if msg["is_from_me"] else get_contact_name(msg["handle_id"])
+                )
+                group_chat_name = chat_mapping.get(
+                    msg.get("cache_roomnames"), "Group Chat"
+                )
+                matched_messages.append(
+                    (
+                        score,
+                        f"[{date_str}] [{group_chat_name}] {direction} (score: {score}): {body}",
+                    )
+                )
+
+        if not matched_messages:
+            return f"No messages matching '{search_term}' found in the allowed chat."
+
+        matched_messages.sort(key=lambda x: x[0], reverse=True)
+        return "\n".join([m[1] for m in matched_messages[:50]])
     except Exception as e:
-        logger.error(f"Error in tool_fuzzy_search_messages: {e}", exc_info=True)
-        return f"An unexpected error occurred during fuzzy message search: {str(e)}"
+        logger.error(f"Error in fuzzy_search_messages: {e}", exc_info=True)
+        return f"Error during fuzzy search: {str(e)}"
 
 
-@mcp.resource("messages://recent/{hours}")
-def get_recent_messages_resource(hours: int = 24) -> str:
-    """Resource that provides recent messages."""
-    return get_recent_messages(hours=hours)
+# ── Attachment tools ──────────────────────────────────────────────────────────
 
-@mcp.resource("messages://contact/{contact}/{hours}")
-def get_contact_messages_resource(contact: str, hours: int = 24) -> str:
-    """Resource that provides messages from a specific contact."""
-    return get_recent_messages(hours=hours, contact=contact)
+# In-memory upload sessions: upload_id -> {path, filename, bytes_written}
+_upload_sessions: dict = {}
+
+
+def _resolve_attachment(attachment_id: int) -> dict | str:
+    """Look up an attachment by ID, enforcing the chat allowlist.
+    Returns the row dict on success or an error string."""
+    query = """
+    SELECT a.ROWID, a.filename, a.mime_type, a.transfer_name, a.total_bytes, a.is_outgoing
+    FROM attachment a
+    JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
+    JOIN message m ON maj.message_id = m.ROWID
+    WHERE a.ROWID = ?
+      AND m.cache_roomnames = ?
+    LIMIT 1
+    """
+    results = query_messages_db(query, (attachment_id, ALLOWED_CHAT_ID))
+    if not results:
+        return "Attachment not found or not in the allowed chat."
+    if "error" in results[0]:
+        return results[0]["error"]
+    return results[0]
+
+
+@mcp.tool()
+def tool_get_attachment(ctx: Context, attachment_id: int) -> str:
+    """
+    Get attachment metadata and a download URL.
+
+    The returned URL can be fetched directly over HTTP (e.g. curl, requests.get)
+    to download the raw file. No base64 encoding, no chunking needed.
+
+    Args:
+        attachment_id: The att_id from a message listing.
+    """
+    if err := _require_allowed_chat():
+        return err
+
+    logger.info(f"Getting attachment metadata for {attachment_id}")
+    try:
+        result = _resolve_attachment(attachment_id)
+        if isinstance(result, str):
+            return f"Error: {result}"
+
+        att = result
+        filename = att.get("filename", "")
+        if filename and filename.startswith("~"):
+            filename = os.path.expanduser(filename)
+
+        port = CONFIG.get("port", 8000)
+        url_host = _get_local_ip()
+
+        info = {
+            "attachment_id": att["ROWID"],
+            "transfer_name": att.get("transfer_name"),
+            "mime_type": att.get("mime_type"),
+            "total_bytes": att.get("total_bytes"),
+            "is_outgoing": bool(att.get("is_outgoing")),
+            "file_exists": os.path.exists(filename) if filename else False,
+            "download_url": f"http://{url_host}:{port}/attachments/{att['ROWID']}",
+        }
+        return json.dumps(info)
+    except Exception as e:
+        logger.error(f"Error getting attachment: {e}")
+        return f"Error getting attachment: {str(e)}"
+
+
+@mcp.tool()
+def tool_send_attachment(
+    ctx: Context,
+    filename: str,
+    chunk_base64: str,
+    upload_id: str = "",
+    is_last: bool = True,
+) -> str:
+    """
+    Send a file/image attachment to the allowed group chat, with chunked upload support.
+
+    For small files (single chunk):
+      Call once with chunk_base64=<all data>, is_last=True.
+
+    For large files (multi-chunk):
+      1. First call: provide filename, chunk_base64=<first chunk>, is_last=False.
+         Returns an upload_id.
+      2. Subsequent calls: provide upload_id, chunk_base64=<next chunk>, is_last=False.
+      3. Final call: provide upload_id, chunk_base64=<last chunk>, is_last=True.
+         This assembles and sends the file.
+
+    Args:
+        filename: Desired filename with extension (e.g. "photo.jpg"). Required on first call.
+        chunk_base64: Base64-encoded chunk of file data.
+        upload_id: Upload session ID returned from the first call. Omit for a new upload.
+        is_last: True if this is the final (or only) chunk. Triggers the send.
+    """
+    if err := _require_allowed_chat():
+        return err
+
+    logger.info(
+        f"Send attachment chunk: filename={filename}, upload_id={upload_id or 'new'}, is_last={is_last}"
+    )
+
+    try:
+        chunk_bytes = base64.b64decode(chunk_base64)
+    except Exception as e:
+        return json.dumps({"error": f"Invalid base64 data: {str(e)}"})
+
+    try:
+        if not upload_id:
+            upload_id = _uuid.uuid4().hex
+            _, ext = os.path.splitext(filename)
+            tmp = tempfile.NamedTemporaryFile(
+                delete=False, suffix=ext, prefix="imsg_att_"
+            )
+            tmp.close()
+            _upload_sessions[upload_id] = {
+                "path": tmp.name,
+                "filename": filename,
+                "bytes_written": 0,
+            }
+
+        session = _upload_sessions.get(upload_id)
+        if not session:
+            return json.dumps({"error": f"Unknown upload_id: {upload_id}"})
+
+        with open(session["path"], "ab") as f:
+            f.write(chunk_bytes)
+        session["bytes_written"] += len(chunk_bytes)
+
+        if not is_last:
+            return json.dumps(
+                {
+                    "upload_id": upload_id,
+                    "bytes_written": session["bytes_written"],
+                    "status": "awaiting_next_chunk",
+                }
+            )
+
+        # Final chunk — send the assembled file
+        tmp_path = session["path"]
+        final_filename = session["filename"]
+        total_written = session["bytes_written"]
+        del _upload_sessions[upload_id]
+
+        chat_guid = _get_chat_guid(ALLOWED_CHAT_ID)
+        script = f'tell application "Messages" to send POSIX file "{tmp_path}" to chat id "{chat_guid}"'
+        result = run_applescript(script)
+
+        def cleanup():
+            import time
+            time.sleep(10)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        threading.Thread(target=cleanup, daemon=True).start()
+
+        if result.startswith("Error:"):
+            return json.dumps({"error": f"Error sending attachment: {result}"})
+
+        return json.dumps(
+            {
+                "status": "sent",
+                "filename": final_filename,
+                "total_bytes": total_written,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error sending attachment: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# ── Diagnostics ──────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def tool_check_db_access(ctx: Context) -> str:
+    """Diagnose database access issues."""
+    logger.info("Checking database access")
+    try:
+        return check_messages_db_access()
+    except Exception as e:
+        return f"Error checking database access: {str(e)}"
+
+
+# ── HTTP attachment endpoint ──────────────────────────────────────────────────
+
+
+async def handle_attachment_download(request: Request) -> Response:
+    """Serve an attachment file over plain HTTP GET /attachments/{id}."""
+    try:
+        attachment_id = int(request.path_params["attachment_id"])
+    except (KeyError, ValueError):
+        return JSONResponse({"error": "Invalid attachment ID"}, status_code=400)
+
+    if not ALLOWED_CHAT_ID:
+        return JSONResponse({"error": "No allowed_chat_id configured"}, status_code=500)
+
+    result = _resolve_attachment(attachment_id)
+    if isinstance(result, str):
+        return JSONResponse({"error": result}, status_code=404)
+
+    att = result
+    filename = att.get("filename", "")
+    if filename and filename.startswith("~"):
+        filename = os.path.expanduser(filename)
+
+    if not filename or not os.path.exists(filename):
+        return JSONResponse({"error": "File not found on disk"}, status_code=404)
+
+    media_type = att.get("mime_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    download_name = att.get("transfer_name") or os.path.basename(filename)
+
+    return FileResponse(
+        path=filename,
+        media_type=media_type,
+        filename=download_name,
+    )
+
+
+async def handle_attachment_upload(request: Request) -> Response:
+    """Accept a file upload via POST /attachments/send and send it to the chat.
+
+    Expects a multipart form with a 'file' field.
+    """
+    if not ALLOWED_CHAT_ID:
+        return JSONResponse({"error": "No allowed_chat_id configured"}, status_code=500)
+
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None:
+        return JSONResponse({"error": "No 'file' field in form data"}, status_code=400)
+
+    _, ext = os.path.splitext(upload.filename or "file.bin")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="imsg_att_") as tmp:
+        contents = await upload.read()
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    chat_guid = _get_chat_guid(ALLOWED_CHAT_ID)
+    script = f'tell application "Messages" to send POSIX file "{tmp_path}" to chat id "{chat_guid}"'
+    result = run_applescript(script)
+
+    def cleanup():
+        import time
+        time.sleep(10)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    threading.Thread(target=cleanup, daemon=True).start()
+
+    if result.startswith("Error:"):
+        return JSONResponse({"error": result}, status_code=500)
+
+    return JSONResponse({
+        "status": "sent",
+        "filename": upload.filename,
+        "total_bytes": len(contents),
+    })
+
+
+# ── Entrypoint ───────────────────────────────────────────────────────────────
+
 
 def run_server():
-    """Run the MCP server with proper error handling"""
-    try:
-        logger.info("Starting Mac Messages MCP server...")
-        mcp.run()
-    except Exception as e:
-        logger.error(f"Failed to start server: {str(e)}")
-        sys.exit(1)
+    """Run the MCP server with proper error handling."""
+    transport = CONFIG["transport"]
+    logger.info(
+        f"Starting Mac Messages MCP server (transport={transport}, "
+        f"allowed_chat={'[NOT SET]' if not ALLOWED_CHAT_ID else ALLOWED_CHAT_ID})..."
+    )
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+        return
+
+    # SSE transport: build a custom Starlette app with MCP + attachment routes
+    sse = SseServerTransport("/messages/")
+
+    async def handle_sse(request: Request):
+        async with sse.connect_sse(
+            request.scope, request.receive, request._send
+        ) as streams:
+            await mcp._mcp_server.run(
+                streams[0],
+                streams[1],
+                mcp._mcp_server.create_initialization_options(),
+            )
+
+    app = Starlette(
+        debug=False,
+        routes=[
+            # MCP SSE routes
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+            # Attachment HTTP routes
+            Route("/attachments/send", endpoint=handle_attachment_upload, methods=["POST"]),
+            Route("/attachments/{attachment_id:int}", endpoint=handle_attachment_download),
+        ],
+    )
+
+    host = CONFIG.get("host", "0.0.0.0")
+    port = CONFIG.get("port", 8000)
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())
+
 
 if __name__ == "__main__":
     run_server()

@@ -61,4 +61,7 @@ venv.bak/
 *.swo
 
 # macOS
-.DS_Store 
+.DS_Store
+
+# Local config (contains user-specific chat ID)
+config.json 

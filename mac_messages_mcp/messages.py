@@ -16,14 +16,28 @@ from thefuzz import fuzz
 
 
 def run_applescript(script: str) -> str:
-    """Run an AppleScript and return the result."""
-    proc = subprocess.Popen(['osascript', '-e', script], 
-                            stdout=subprocess.PIPE, 
-                            stderr=subprocess.PIPE)
-    out, err = proc.communicate()
+    """Run an AppleScript and return the result.
+
+    Automatically uses stdin pipe for multiline scripts.
+    """
+    if "\n" in script:
+        proc = subprocess.Popen(
+            ["osascript", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, err = proc.communicate(input=script.encode("utf-8"))
+    else:
+        proc = subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, err = proc.communicate()
     if proc.returncode != 0:
         return f"Error: {err.decode('utf-8')}"
-    return out.decode('utf-8').strip()
+    return out.decode("utf-8").strip()
 
 def get_chat_mapping() -> Dict[str, str]:
     """
@@ -567,7 +581,7 @@ def _send_message_to_recipient(recipient: str, message: str, contact_name: str =
         if not group_chat:
             command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to participant "{recipient}" of (1st service whose service type = iMessage)'
         else:
-            command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to chat "{recipient}"'
+            command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to chat id "{recipient}"'
         
         # Run the AppleScript
         result = run_applescript(command)
@@ -1149,7 +1163,7 @@ def _send_message_direct(
         tell application "Messages"
             try
                 -- Try to get the existing chat
-                set targetChat to chat "{safe_recipient}"
+                set targetChat to chat id "{safe_recipient}"
                 
                 -- Send the message
                 send "{safe_message}" to targetChat

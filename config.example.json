@@ -1,0 +1,6 @@
+{
+  "allowed_chat_id": "YOUR_CHAT_IDENTIFIER_HERE",
+  "transport": "sse",
+  "host": "0.0.0.0",
+  "port": 8000
+}
