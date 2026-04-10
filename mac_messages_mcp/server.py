@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Mac Messages MCP - Scoped to a single allowed group chat.
+Mac Messages MCP - Scoped to a configurable allow-list of chats.
 
 Configuration is loaded from config.json in the project root, with env var overrides:
-  - ALLOWED_CHAT_ID: The chat_identifier to lock to (required)
+  - ALLOWED_CHAT_ID: Chat scope. Accepts:
+        "abc123"          single chat (string)
+        "*"               all chats (no restriction)
+        "abc,def"         comma-separated list (env var form)
+        ["abc", "def"]    JSON list (config.json form)
   - MCP_TRANSPORT: "stdio" or "sse" (default: "stdio")
   - CHUNK_SIZE_BYTES: Chunk size for attachment transfers (default: 524288)
 
@@ -63,20 +67,126 @@ def _load_config() -> dict:
         except Exception as e:
             logger.warning(f"Failed to read {config_path}: {e}")
 
+    # allowed_chat_id may be a string, "*", or a list. Env var (string) wins
+    # if present, then falls back to whatever the file provided.
+    raw_allowed: object
+    env_val = os.environ.get("ALLOWED_CHAT_ID")
+    if env_val is not None:
+        raw_allowed = env_val
+    else:
+        raw_allowed = config.get("allowed_chat_id", "")
+
     return {
-        "allowed_chat_id": os.environ.get("ALLOWED_CHAT_ID", config.get("allowed_chat_id", "")),
+        "allowed_chat_id_raw": raw_allowed,
         "transport": os.environ.get("MCP_TRANSPORT", config.get("transport", "stdio")),
         "host": os.environ.get("MCP_HOST", config.get("host", "0.0.0.0")),
         "port": int(os.environ.get("MCP_PORT", config.get("port", 8000))),
     }
 
-CONFIG = _load_config()
-ALLOWED_CHAT_ID = CONFIG["allowed_chat_id"]
 
-if not ALLOWED_CHAT_ID:
+def _parse_allowed_chats(raw: object) -> tuple[set[str], bool]:
+    """Normalize the allowed_chat_id config value into (id_set, allow_all).
+
+    Accepts:
+      - None / ""           → ({}, False)   nothing configured
+      - "*"                 → ({}, True)    all chats allowed
+      - "abc"               → ({"abc"}, False)
+      - "abc,def"           → ({"abc", "def"}, False)   env-var list form
+      - ["abc", "def"]      → ({"abc", "def"}, False)   config.json list form
+      - any list containing "*" → ({}, True)
+    """
+    if raw is None or raw == "":
+        return set(), False
+    if isinstance(raw, str):
+        if raw.strip() == "*":
+            return set(), True
+        ids = {s.strip() for s in raw.split(",") if s.strip()}
+        if "*" in ids:
+            return set(), True
+        return ids, False
+    if isinstance(raw, (list, tuple)):
+        ids = {str(s).strip() for s in raw if str(s).strip()}
+        if "*" in ids:
+            return set(), True
+        return ids, False
+    logger.warning(f"Unrecognized allowed_chat_id value type: {type(raw).__name__}; treating as empty")
+    return set(), False
+
+
+CONFIG = _load_config()
+ALLOWED_CHAT_IDS, ALLOW_ALL_CHATS = _parse_allowed_chats(CONFIG["allowed_chat_id_raw"])
+
+if ALLOW_ALL_CHATS:
+    logger.warning(
+        "allowed_chat_id is set to '*' — single-chat lockdown is DISABLED. "
+        "The server has access to ALL chats in the Messages database."
+    )
+elif not ALLOWED_CHAT_IDS:
     logger.error(
         "No allowed_chat_id configured. Set it in config.json or the ALLOWED_CHAT_ID env var. "
         "Run tool_list_chats to discover available chat identifiers."
+    )
+else:
+    logger.info(f"Allow-list configured: {len(ALLOWED_CHAT_IDS)} chat(s)")
+
+
+def _has_any_allowed() -> bool:
+    """True if any chat (including '*') is allowed."""
+    return ALLOW_ALL_CHATS or bool(ALLOWED_CHAT_IDS)
+
+
+def _chat_is_allowed(chat_identifier: str) -> bool:
+    """True if the given chat_identifier is in the allow list."""
+    return ALLOW_ALL_CHATS or chat_identifier in ALLOWED_CHAT_IDS
+
+
+def _allowed_chats_sql(column: str) -> tuple[str, tuple]:
+    """Build a SQL fragment + params for restricting a column to the allow list.
+
+    Returns ("1=1", ()) when all chats are allowed,
+    ("0=1", ()) when nothing is allowed (defensive — caller should _require_allowed_chat first),
+    ("col IN (?, ?, ...)", (id1, id2, ...)) otherwise.
+    """
+    if ALLOW_ALL_CHATS:
+        return "1=1", ()
+    if not ALLOWED_CHAT_IDS:
+        return "0=1", ()
+    placeholders = ",".join(["?"] * len(ALLOWED_CHAT_IDS))
+    # Sort for stable parameter ordering (helps tests / logging)
+    return f"{column} IN ({placeholders})", tuple(sorted(ALLOWED_CHAT_IDS))
+
+
+def _resolve_target_chat(requested: str | None) -> tuple[str | None, str | None]:
+    """Pick a chat to send to. Returns (chat_identifier, error_message).
+
+    - If `requested` is given: validate it's in the allow list and return it.
+    - If exactly one chat is allowed and no `requested`: return that one (back-compat).
+    - If multiple chats are allowed and no `requested`: error (must disambiguate).
+    - If '*' is set and no `requested`: error (sends require an explicit target).
+    """
+    if requested:
+        requested = requested.strip()
+        if not _chat_is_allowed(requested):
+            return None, (
+                f"Error: chat_identifier {requested!r} is not in the allow list. "
+                "Use tool_list_chats to see allowed chats."
+            )
+        return requested, None
+    if ALLOW_ALL_CHATS:
+        return None, (
+            "Error: chat_identifier is required when allowed_chat_id='*'. "
+            "Use tool_list_chats to discover chat identifiers."
+        )
+    if len(ALLOWED_CHAT_IDS) == 1:
+        return next(iter(ALLOWED_CHAT_IDS)), None
+    if len(ALLOWED_CHAT_IDS) > 1:
+        return None, (
+            f"Error: {len(ALLOWED_CHAT_IDS)} chats are allowed; specify chat_identifier explicitly. "
+            "Use tool_list_chats to see allowed chats."
+        )
+    return None, (
+        "Error: No allowed chats configured. "
+        "Set allowed_chat_id in config.json or the ALLOWED_CHAT_ID env var."
     )
 
 
@@ -117,6 +227,7 @@ def tool_list_chats(ctx: Context) -> str:
     """
     List all named group chats from the Messages app.
 
+    Marks each chat as (ACTIVE) if it is in the current allow list.
     Use this to find the chat_identifier to put in config.json.
     """
     logger.info("Listing available chats")
@@ -129,20 +240,28 @@ def tool_list_chats(ctx: Context) -> str:
             return f"Error: {results[0]['error']}"
         lines = []
         for i, r in enumerate(results, 1):
-            active = " (ACTIVE)" if r["chat_identifier"] == ALLOWED_CHAT_ID else ""
+            active = " (ACTIVE)" if _chat_is_allowed(r["chat_identifier"]) else ""
             lines.append(f"{i}. {r['display_name']} -> {r['chat_identifier']}{active}")
-        return "Available group chats:\n" + "\n".join(lines)
+        header = "Available group chats"
+        if ALLOW_ALL_CHATS:
+            header += " (allowed_chat_id='*' — all chats are active)"
+        elif ALLOWED_CHAT_IDS:
+            header += f" ({len(ALLOWED_CHAT_IDS)} in allow list)"
+        else:
+            header += " (no allow list configured — all marked inactive)"
+        return f"{header}:\n" + "\n".join(lines)
     except Exception as e:
         return f"Error listing chats: {str(e)}"
 
 
 def _require_allowed_chat() -> str | None:
-    """Return an error string if no chat is configured, else None."""
-    if not ALLOWED_CHAT_ID:
+    """Return an error string if no chat scope is configured, else None."""
+    if not _has_any_allowed():
         return (
-            "Error: No allowed_chat_id configured. "
-            "Use tool_list_chats to find your chat identifier, "
-            "then set it in config.json or the ALLOWED_CHAT_ID env var."
+            "Error: No allowed chats configured. "
+            "Use tool_list_chats to find your chat identifier(s), then set "
+            "allowed_chat_id in config.json or the ALLOWED_CHAT_ID env var. "
+            "Accepts a single id, a list, or '*' for all chats."
         )
     return None
 
@@ -292,7 +411,7 @@ def _apple_timestamp_for_hours_ago(hours: int) -> str:
 @mcp.tool()
 def tool_get_recent_messages(ctx: Context, hours: int = 24) -> str:
     """
-    Get recent messages from the allowed group chat, in chronological order.
+    Get recent messages from the allowed chat(s), in chronological order.
 
     Args:
         hours: Number of hours to look back (default: 24)
@@ -300,7 +419,7 @@ def tool_get_recent_messages(ctx: Context, hours: int = 24) -> str:
     if err := _require_allowed_chat():
         return err
 
-    logger.info(f"Getting recent messages from allowed chat: hours={hours}")
+    logger.info(f"Getting recent messages: hours={hours}")
     try:
         if hours < 0:
             return "Error: Hours cannot be negative."
@@ -309,16 +428,17 @@ def tool_get_recent_messages(ctx: Context, hours: int = 24) -> str:
             return f"Error: Hours value too large. Maximum allowed is {MAX_HOURS} hours."
 
         timestamp_str = _apple_timestamp_for_hours_ago(hours)
+        clause, clause_params = _allowed_chats_sql("m.cache_roomnames")
 
         query = f"""
         SELECT {_MESSAGE_COLUMNS}
         FROM message m
         WHERE CAST(m.date AS TEXT) > ?
-          AND m.cache_roomnames = ?
+          AND {clause}
         ORDER BY m.date DESC
         LIMIT 100
         """
-        messages = query_messages_db(query, (timestamp_str, ALLOWED_CHAT_ID))
+        messages = query_messages_db(query, (timestamp_str, *clause_params))
         return _format_messages(messages)
     except Exception as e:
         logger.error(f"Error in get_recent_messages: {str(e)}")
@@ -332,6 +452,7 @@ def tool_get_new_messages(ctx: Context) -> str:
 
     On the first call, returns messages from the last 1 hour.
     On subsequent calls, returns only messages received after the previous call.
+    Scope is the entire allow list (or all chats if allowed_chat_id='*').
     """
     global _last_seen_timestamp
     if err := _require_allowed_chat():
@@ -343,15 +464,17 @@ def tool_get_new_messages(ctx: Context) -> str:
         if _last_seen_timestamp == "0":
             _last_seen_timestamp = _apple_timestamp_for_hours_ago(1)
 
+        clause, clause_params = _allowed_chats_sql("m.cache_roomnames")
+
         query = f"""
         SELECT {_MESSAGE_COLUMNS}
         FROM message m
         WHERE CAST(m.date AS TEXT) > ?
-          AND m.cache_roomnames = ?
+          AND {clause}
         ORDER BY m.date DESC
         LIMIT 100
         """
-        messages = query_messages_db(query, (_last_seen_timestamp, ALLOWED_CHAT_ID))
+        messages = query_messages_db(query, (_last_seen_timestamp, *clause_params))
 
         if not messages or "error" in messages[0]:
             return _format_messages(messages)
@@ -367,19 +490,26 @@ def tool_get_new_messages(ctx: Context) -> str:
 
 
 @mcp.tool()
-def tool_send_message(ctx: Context, message: str) -> str:
+def tool_send_message(ctx: Context, message: str, chat_identifier: str = "") -> str:
     """
-    Send a message to the allowed group chat.
+    Send a message to a chat in the allow list.
 
     Args:
         message: Message text to send
+        chat_identifier: Target chat. Optional when exactly one chat is allowed
+            (it will be used automatically). Required when multiple chats are
+            allowed or when allowed_chat_id='*'.
     """
     if err := _require_allowed_chat():
         return err
 
-    logger.info(f"Sending message to allowed chat {ALLOWED_CHAT_ID}")
+    target, target_err = _resolve_target_chat(chat_identifier or None)
+    if target_err:
+        return target_err
+
+    logger.info(f"Sending message to chat {target}")
     try:
-        chat_guid = _get_chat_guid(ALLOWED_CHAT_ID)
+        chat_guid = _get_chat_guid(target)
         result = send_message(recipient=chat_guid, message=message, group_chat=True)
         return result
     except Exception as e:
@@ -407,7 +537,7 @@ def tool_fuzzy_search_messages(
     if hours <= 0:
         return "Error: Hours must be a positive integer."
 
-    logger.info(f"Fuzzy searching allowed chat for '{search_term}' in last {hours} hours")
+    logger.info(f"Fuzzy searching allowed chats for '{search_term}' in last {hours} hours")
     try:
         from datetime import datetime, timedelta, timezone
 
@@ -424,17 +554,19 @@ def tool_fuzzy_search_messages(
         nanoseconds_since_apple_epoch = int(seconds_since_apple_epoch * 1_000_000_000)
         timestamp_str = str(nanoseconds_since_apple_epoch)
 
-        query = """
+        clause, clause_params = _allowed_chats_sql("m.cache_roomnames")
+
+        query = f"""
         SELECT
             m.ROWID, m.date, m.text, m.attributedBody,
             m.is_from_me, m.handle_id, m.cache_roomnames
         FROM message m
         WHERE CAST(m.date AS TEXT) > ?
-          AND m.cache_roomnames = ?
+          AND {clause}
         ORDER BY m.date DESC
         LIMIT 500
         """
-        messages = query_messages_db(query, (timestamp_str, ALLOWED_CHAT_ID))
+        messages = query_messages_db(query, (timestamp_str, *clause_params))
 
         if not messages:
             return "No messages found in the specified time period."
@@ -502,20 +634,21 @@ _upload_sessions: dict = {}
 
 
 def _resolve_attachment(attachment_id: int) -> dict | str:
-    """Look up an attachment by ID, enforcing the chat allowlist.
+    """Look up an attachment by ID, enforcing the chat allow list.
     Returns the row dict on success or an error string."""
-    query = """
+    clause, clause_params = _allowed_chats_sql("m.cache_roomnames")
+    query = f"""
     SELECT a.ROWID, a.filename, a.mime_type, a.transfer_name, a.total_bytes, a.is_outgoing
     FROM attachment a
     JOIN message_attachment_join maj ON a.ROWID = maj.attachment_id
     JOIN message m ON maj.message_id = m.ROWID
     WHERE a.ROWID = ?
-      AND m.cache_roomnames = ?
+      AND {clause}
     LIMIT 1
     """
-    results = query_messages_db(query, (attachment_id, ALLOWED_CHAT_ID))
+    results = query_messages_db(query, (attachment_id, *clause_params))
     if not results:
-        return "Attachment not found or not in the allowed chat."
+        return "Attachment not found or not in the allowed chats."
     if "error" in results[0]:
         return results[0]["error"]
     return results[0]
@@ -571,16 +704,18 @@ def tool_send_attachment(
     chunk_base64: str,
     upload_id: str = "",
     is_last: bool = True,
+    chat_identifier: str = "",
 ) -> str:
     """
-    Send a file/image attachment to the allowed group chat, with chunked upload support.
+    Send a file/image attachment to a chat in the allow list, with chunked upload support.
 
     For small files (single chunk):
       Call once with chunk_base64=<all data>, is_last=True.
 
     For large files (multi-chunk):
       1. First call: provide filename, chunk_base64=<first chunk>, is_last=False.
-         Returns an upload_id.
+         Returns an upload_id. Also pass chat_identifier on the first call if
+         multiple chats are allowed.
       2. Subsequent calls: provide upload_id, chunk_base64=<next chunk>, is_last=False.
       3. Final call: provide upload_id, chunk_base64=<last chunk>, is_last=True.
          This assembles and sends the file.
@@ -590,6 +725,10 @@ def tool_send_attachment(
         chunk_base64: Base64-encoded chunk of file data.
         upload_id: Upload session ID returned from the first call. Omit for a new upload.
         is_last: True if this is the final (or only) chunk. Triggers the send.
+        chat_identifier: Target chat. Optional when exactly one chat is allowed.
+            Required when multiple chats are allowed or when allowed_chat_id='*'.
+            Only honored on the first chunk of a session (the target is then
+            captured for the rest of the upload).
     """
     if err := _require_allowed_chat():
         return err
@@ -605,6 +744,9 @@ def tool_send_attachment(
 
     try:
         if not upload_id:
+            target, target_err = _resolve_target_chat(chat_identifier or None)
+            if target_err:
+                return json.dumps({"error": target_err})
             upload_id = _uuid.uuid4().hex
             _, ext = os.path.splitext(filename)
             tmp = tempfile.NamedTemporaryFile(
@@ -615,6 +757,7 @@ def tool_send_attachment(
                 "path": tmp.name,
                 "filename": filename,
                 "bytes_written": 0,
+                "target_chat": target,
             }
 
         session = _upload_sessions.get(upload_id)
@@ -638,9 +781,10 @@ def tool_send_attachment(
         tmp_path = session["path"]
         final_filename = session["filename"]
         total_written = session["bytes_written"]
+        target_chat = session["target_chat"]
         del _upload_sessions[upload_id]
 
-        chat_guid = _get_chat_guid(ALLOWED_CHAT_ID)
+        chat_guid = _get_chat_guid(target_chat)
         script = f'tell application "Messages" to send POSIX file "{tmp_path}" to chat id "{chat_guid}"'
         result = run_applescript(script)
 
@@ -691,8 +835,8 @@ async def handle_attachment_download(request: Request) -> Response:
     except (KeyError, ValueError):
         return JSONResponse({"error": "Invalid attachment ID"}, status_code=400)
 
-    if not ALLOWED_CHAT_ID:
-        return JSONResponse({"error": "No allowed_chat_id configured"}, status_code=500)
+    if not _has_any_allowed():
+        return JSONResponse({"error": "No allowed chats configured"}, status_code=500)
 
     result = _resolve_attachment(attachment_id)
     if isinstance(result, str):
@@ -717,17 +861,26 @@ async def handle_attachment_download(request: Request) -> Response:
 
 
 async def handle_attachment_upload(request: Request) -> Response:
-    """Accept a file upload via POST /attachments/send and send it to the chat.
+    """Accept a file upload via POST /attachments/send and send it to a chat.
 
-    Expects a multipart form with a 'file' field.
+    Expects a multipart form with a 'file' field. Optional 'chat_identifier'
+    form field selects the target chat — required when multiple chats are
+    allowed or when allowed_chat_id='*'.
     """
-    if not ALLOWED_CHAT_ID:
-        return JSONResponse({"error": "No allowed_chat_id configured"}, status_code=500)
+    if not _has_any_allowed():
+        return JSONResponse({"error": "No allowed chats configured"}, status_code=500)
 
     form = await request.form()
     upload = form.get("file")
     if upload is None:
         return JSONResponse({"error": "No 'file' field in form data"}, status_code=400)
+
+    requested_chat = form.get("chat_identifier") or None
+    if isinstance(requested_chat, str):
+        requested_chat = requested_chat.strip() or None
+    target, target_err = _resolve_target_chat(requested_chat if isinstance(requested_chat, str) else None)
+    if target_err:
+        return JSONResponse({"error": target_err}, status_code=400)
 
     _, ext = os.path.splitext(upload.filename or "file.bin")
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="imsg_att_") as tmp:
@@ -735,7 +888,7 @@ async def handle_attachment_upload(request: Request) -> Response:
         tmp.write(contents)
         tmp_path = tmp.name
 
-    chat_guid = _get_chat_guid(ALLOWED_CHAT_ID)
+    chat_guid = _get_chat_guid(target)
     script = f'tell application "Messages" to send POSIX file "{tmp_path}" to chat id "{chat_guid}"'
     result = run_applescript(script)
 
@@ -755,6 +908,7 @@ async def handle_attachment_upload(request: Request) -> Response:
         "status": "sent",
         "filename": upload.filename,
         "total_bytes": len(contents),
+        "chat_identifier": target,
     })
 
 
@@ -764,9 +918,16 @@ async def handle_attachment_upload(request: Request) -> Response:
 def run_server():
     """Run the MCP server with proper error handling."""
     transport = CONFIG["transport"]
+    if ALLOW_ALL_CHATS:
+        scope_desc = "* (ALL CHATS)"
+    elif not ALLOWED_CHAT_IDS:
+        scope_desc = "[NOT SET]"
+    elif len(ALLOWED_CHAT_IDS) == 1:
+        scope_desc = next(iter(ALLOWED_CHAT_IDS))
+    else:
+        scope_desc = f"{len(ALLOWED_CHAT_IDS)} chats"
     logger.info(
-        f"Starting Mac Messages MCP server (transport={transport}, "
-        f"allowed_chat={'[NOT SET]' if not ALLOWED_CHAT_ID else ALLOWED_CHAT_ID})..."
+        f"Starting Mac Messages MCP server (transport={transport}, allowed_chats={scope_desc})..."
     )
 
     if transport == "stdio":

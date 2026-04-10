@@ -1,4 +1,10 @@
 {
+  "_comment_allowed_chat_id": "Accepts a single string, '*' for all chats, or a JSON list of chat identifiers",
+  "_examples": {
+    "single":   "abc123def456",
+    "multiple": ["abc123def456", "fedcba654321"],
+    "all":      "*"
+  },
   "allowed_chat_id": "YOUR_CHAT_IDENTIFIER_HERE",
   "transport": "sse",
   "host": "0.0.0.0",

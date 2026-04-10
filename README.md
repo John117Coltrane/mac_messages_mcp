@@ -112,38 +112,66 @@ You can preflight this from Python with
 
 ## Configuration
 
-The fork is **scoped to a single allowed chat**. Before running the server,
-copy the example config and fill in your chat identifier:
+The fork is **scoped to a configurable allow list of chats**. Before
+running the server, copy the example config and fill in your chat
+identifier(s):
 
 ```bash
 cp config.example.json config.json
 ```
 
-`config.example.json` looks like:
+`allowed_chat_id` accepts three forms:
+
+| Form | Example | Behavior |
+| --- | --- | --- |
+| Single string | `"abc123def456"` | Lock the server to one chat (the original single-chat lockdown) |
+| `"*"` | `"*"` | Allow **all** chats — lockdown disabled, logged as a warning at startup |
+| JSON list | `["abc123", "fedcba654321"]` | Allow several specific chats |
+
+A multi-chat config looks like:
 
 ```json
 {
-  "allowed_chat_id": "YOUR_CHAT_IDENTIFIER_HERE",
+  "allowed_chat_id": ["abc123def456", "fedcba654321"],
   "transport": "sse",
   "host": "0.0.0.0",
   "port": 8000
 }
 ```
 
-To discover the right `allowed_chat_id`, start the server once with any
-value and call `tool_list_chats` over MCP — it returns the chat identifiers
-visible in the Messages database. Paste the right one back into
-`config.json` and restart.
+To discover the right identifier(s), start the server once with any value
+and call `tool_list_chats` over MCP — it returns every chat in the
+Messages database and marks the ones currently in the allow list as
+`(ACTIVE)`. Paste the right ones back into `config.json` and restart.
 
-Environment variable overrides (take precedence over `config.json`):
+### Sending when multiple chats are allowed
 
-| Variable            | Purpose                                    |
-| ------------------- | ------------------------------------------ |
-| `ALLOWED_CHAT_ID`   | The single chat the server is locked to   |
+When more than one chat is in the allow list (or when `allowed_chat_id`
+is `"*"`), the send tools cannot guess a target. They take an optional
+`chat_identifier` parameter:
+
+| Tool | New parameter |
+| --- | --- |
+| `tool_send_message(message, chat_identifier="")` | required if multiple chats are allowed |
+| `tool_send_attachment(filename, chunk_base64, ..., chat_identifier="")` | required on first chunk if multiple chats are allowed |
+| `POST /attachments/send` | accepts a `chat_identifier` form field |
+
+If the server is locked to a single chat, the parameter can be omitted —
+back-compat is preserved.
+
+### Environment variable overrides
+
+Take precedence over `config.json`:
+
+| Variable            | Purpose                                                        |
+| ------------------- | -------------------------------------------------------------- |
+| `ALLOWED_CHAT_ID`   | Chat scope. Accepts a single id, comma-separated list (`a,b,c`), or `*` |
 | `MCP_TRANSPORT`     | `stdio` or `sse` (default `stdio` upstream, `sse` in this fork) |
-| `CHUNK_SIZE_BYTES`  | Chunk size for attachment transfers (default 524288) |
+| `MCP_HOST`          | Bind host (default `0.0.0.0`)                                  |
+| `MCP_PORT`          | Bind port (default `8000`)                                     |
+| `CHUNK_SIZE_BYTES`  | Chunk size for attachment transfers (default 524288)           |
 
-`config.json` is gitignored — keep your chat ID out of source control.
+`config.json` is gitignored — keep your chat IDs out of source control.
 
 ## Integration
 

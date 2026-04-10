@@ -11,6 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Multi-chat allow list.** `allowed_chat_id` is now polymorphic and accepts:
+  - a single string (current single-chat behavior, fully back-compat)
+  - `"*"` to allow all chats — single-chat lockdown is then explicitly
+    disabled (logged as a warning at startup)
+  - a JSON list (`["abc", "def"]`) of chat identifiers in `config.json`
+  - a comma-separated string (`"abc,def"`) for the `ALLOWED_CHAT_ID` env var
+- **Send disambiguation**: `tool_send_message`, `tool_send_attachment`, and
+  `POST /attachments/send` now accept an optional `chat_identifier` parameter.
+  - When exactly one chat is allowed → parameter is optional, that chat is
+    used (back-compat preserved).
+  - When multiple chats are allowed or `*` is set → parameter is required;
+    the server returns an error explaining how to disambiguate.
+  - Supplied identifiers are validated against the allow list; unknown ones
+    are rejected.
+- **Helpers** added in `server.py`: `_parse_allowed_chats`, `_chat_is_allowed`,
+  `_allowed_chats_sql`, `_resolve_target_chat`, `_has_any_allowed`.
+
+### Changed
+- **`tool_list_chats`** now marks every chat in the allow list as `(ACTIVE)`
+  instead of just the first one, and the header reflects whether the server
+  is in single, multi, `*`, or no-scope mode.
+- **`tool_get_recent_messages` / `tool_get_new_messages` /
+  `tool_fuzzy_search_messages`** SQL switched from `cache_roomnames = ?`
+  to `cache_roomnames IN (?, ...)` (or `1=1` when `*`).
+- **`_resolve_attachment`** and the HTTP attachment download / upload routes
+  now enforce the same multi-chat allow list.
+- **Startup log line** reports the scope as `[NOT SET]`, the single
+  identifier, `* (ALL CHATS)`, or `N chats` instead of always printing one ID.
+
+### Added
 - **`ui_automation.py` helper module** for actions the standard AppleScript
   `send` command can't perform. Drives Messages.app via System Events /
   Accessibility:
