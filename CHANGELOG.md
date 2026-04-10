@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **Fork notice:** Entries from `0.8.0` onward are specific to the
+> `John117Coltrane/mac_messages_mcp` fork and are not published to PyPI.
+
+## [Unreleased]
+
+### Added
+- **`ui_automation.py` helper module** for actions the standard AppleScript
+  `send` command can't perform. Drives Messages.app via System Events /
+  Accessibility:
+  - `send_tapback()` — standard tapbacks (love/like/dislike/laugh/emphasis/
+    question) and arbitrary emoji reactions
+  - `send_reply()` — threaded replies to a specific message
+  - `send_multiple_attachments()` — sequential multi-file sends
+  - `send_image_with_caption()` — image + text caption pair
+  - `check_accessibility()` — preflight for Accessibility permission
+  - Requires **System Settings → Privacy & Security → Accessibility** access
+    for the terminal app or `osascript`.
+  - **Note:** module is not yet exposed as MCP tools in `server.py`; helpers
+    are callable from Python only.
+
+## [0.8.0] - 2026-04-06
+
+> Fork-only release. Major rework of `server.py` for a single-chat,
+> network-accessible deployment model.
+
+### Added
+- **`config.json`-based setup** (gitignored) with `config.example.json`
+  template. Configurable keys: `allowed_chat_id`, `transport`, `host`, `port`.
+  Env var overrides: `ALLOWED_CHAT_ID`, `MCP_TRANSPORT`, `CHUNK_SIZE_BYTES`.
+- **Single-chat lockdown**: every tool is scoped to one `chat_identifier`;
+  the server refuses to read or send outside it.
+- **SSE transport with custom Starlette app** alongside MCP, exposing HTTP
+  endpoints for attachment transfer:
+  - `GET /attachments/{id}` — download an attachment by DB id
+  - `POST /attachments/send` — chunked upload + send
+- **`tool_get_new_messages`** — server-side high-water mark for incremental
+  polling.
+- **`tool_list_chats`** — discover chat identifiers during initial setup.
+- **Chunked upload support** in `tool_send_attachment` for large files.
+
+### Changed
+- **`tool_get_recent_messages` output enriched** with:
+  - Tapback / reaction annotations per message
+  - `EDITED` / `UNSENT` / `REPLY` status flags
+  - `msg_id` on every message for targeting
+  - Attachment metadata with download URLs (resolved against the real LAN IP)
+  - Chronological (earliest → latest) ordering
+  - Timezone-aware timestamps (e.g. `2026-03-23 15:58:28 PDT`)
+- **AppleScript send** switched from `chat` to `chat id` for reliable group
+  chat delivery.
+- **`run_applescript`** now supports multiline scripts via stdin pipe instead
+  of `-e` flag, removing length and quoting limits.
+- **Configurable host/port** via `config.json` or env vars (default
+  `0.0.0.0:8000` for SSE).
+
+### Removed
+- Direct PyPI marketing (`uvx mac-messages-mcp`) as the primary install
+  path — the fork runs from source against a local `config.json`.
+
 ## [0.7.0] - 2024-12-28
 
 ### 🚀 MAJOR FEATURE: SMS/RCS Fallback Support

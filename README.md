@@ -1,6 +1,15 @@
 # Mac Messages MCP
 
-A Python bridge for interacting with the macOS Messages app using MCP (Multiple Context Protocol). 
+A Python bridge for interacting with the macOS Messages app using MCP (Multiple Context Protocol).
+
+> **Fork notice.** This is the `John117Coltrane/mac_messages_mcp` fork of
+> [`carterlasalle/mac_messages_mcp`](https://github.com/carterlasalle/mac_messages_mcp).
+> It diverges meaningfully from upstream: the server is **scoped to a single
+> allowed chat**, runs over **SSE with HTTP attachment endpoints**, and ships
+> a **`ui_automation` helper module** for tapbacks, threaded replies, and
+> multi-attachment sends. It is **not** published to PyPI — run from source
+> against a local `config.json`. See [Configuration](#configuration) and
+> [CHANGELOG.md](CHANGELOG.md) for details.
 
 [![PyPI Downloads](https://static.pepy.tech/badge/mac-messages-mcp)](https://pepy.tech/projects/mac-messages-mcp)
 
@@ -29,6 +38,26 @@ See the [Integration section](#integration) below for setup instructions.
 
 ## Features
 
+### Fork additions (0.8.0+)
+- **Single-chat lockdown**: every tool is scoped to one `chat_identifier`
+  loaded from `config.json`; the server refuses to read or send outside it.
+- **SSE transport + HTTP attachment endpoints**: serves MCP over SSE on a
+  Starlette app with `GET /attachments/{id}` (download) and
+  `POST /attachments/send` (chunked upload) alongside the MCP routes.
+- **Enriched message output** from `tool_get_recent_messages`: tapback
+  annotations, `EDITED`/`UNSENT`/`REPLY` flags, `msg_id` for targeting,
+  attachment metadata with LAN download URLs, chronological ordering, and
+  timezone-aware timestamps.
+- **`tool_get_new_messages`**: server-side high-water mark for incremental
+  polling.
+- **`tool_list_chats`**: discover chat identifiers during initial setup.
+- **`ui_automation` helper module**: tapback reactions (standard names + any
+  emoji), threaded replies, multi-attachment sends, and image-with-caption.
+  Drives Messages.app via System Events / Accessibility. Currently a Python
+  helper module — not yet wired as MCP tools. Requires Accessibility
+  permission for the terminal app or `osascript`.
+
+### Inherited from upstream
 - **Universal Message Sending**: Automatically sends via iMessage or SMS/RCS based on recipient availability
 - **Smart Fallback**: Seamless fallback to SMS when iMessage is unavailable (perfect for Android users)
 - **Message Reading**: Read recent messages from the macOS Messages app
@@ -66,6 +95,55 @@ To grant Full Disk Access:
 2. Click the lock icon to make changes
 3. Add your terminal app (Terminal, iTerm2, etc.) or Claude Desktop/Cursor to the list
 4. Restart your terminal or application after granting permission
+
+### Accessibility Permission (only if you use `ui_automation`)
+
+⚠️ The `ui_automation` helper module drives Messages.app via System Events
+to perform tapbacks, threaded replies, and other actions the standard
+AppleScript `send` command cannot do. It requires **Accessibility** access
+in addition to Full Disk Access.
+
+1. Open **System Settings** > **Privacy & Security** > **Accessibility**
+2. Add your terminal app (Terminal, iTerm2, etc.) — or `osascript` directly
+3. Restart your terminal after granting permission
+
+You can preflight this from Python with
+`mac_messages_mcp.ui_automation.check_accessibility()`.
+
+## Configuration
+
+The fork is **scoped to a single allowed chat**. Before running the server,
+copy the example config and fill in your chat identifier:
+
+```bash
+cp config.example.json config.json
+```
+
+`config.example.json` looks like:
+
+```json
+{
+  "allowed_chat_id": "YOUR_CHAT_IDENTIFIER_HERE",
+  "transport": "sse",
+  "host": "0.0.0.0",
+  "port": 8000
+}
+```
+
+To discover the right `allowed_chat_id`, start the server once with any
+value and call `tool_list_chats` over MCP — it returns the chat identifiers
+visible in the Messages database. Paste the right one back into
+`config.json` and restart.
+
+Environment variable overrides (take precedence over `config.json`):
+
+| Variable            | Purpose                                    |
+| ------------------- | ------------------------------------------ |
+| `ALLOWED_CHAT_ID`   | The single chat the server is locked to   |
+| `MCP_TRANSPORT`     | `stdio` or `sse` (default `stdio` upstream, `sse` in this fork) |
+| `CHUNK_SIZE_BYTES`  | Chunk size for attachment transfers (default 524288) |
+
+`config.json` is gitignored — keep your chat ID out of source control.
 
 ## Integration
 
@@ -152,21 +230,34 @@ npx mcp-proxy uvx another-mcp-server --port 8002 --host 0.0.0.0
 **Note:** Binding to `0.0.0.0` exposes the service to all network interfaces. In production, consider using more restrictive host bindings and adding authentication.
 
 
-### Option 1: Install from PyPI
+### Install from source (this fork)
+
+This fork is **not** published to PyPI — install from source:
+
+```bash
+# Clone the fork
+git clone https://github.com/John117Coltrane/mac_messages_mcp.git
+cd mac_messages_mcp
+
+# Set up your chat scope (see Configuration above)
+cp config.example.json config.json
+$EDITOR config.json
+
+# Install + run via uv
+uv sync
+uv run python -m mac_messages_mcp.server
+```
+
+The server will start on `http://0.0.0.0:8000` (SSE) by default and log
+`Starting Mac Messages MCP server (transport=sse, allowed_chat=...)`.
+
+### Install from PyPI (upstream only)
+
+If you want the upstream package without the fork's single-chat lockdown
+and SSE transport, use the published version instead:
 
 ```bash
 uv pip install mac-messages-mcp
-```
-
-### Option 2: Install from source
-
-```bash
-# Clone the repository
-git clone https://github.com/carterlasalle/mac_messages_mcp.git
-cd mac_messages_mcp
-
-# Install dependencies
-uv install -e .
 ```
 
 
@@ -208,9 +299,26 @@ print(result)  # Shows whether sent via iMessage or SMS
 ### As a Command-Line Tool
 
 ```bash
-# Run the MCP server directly
+# Run the MCP server directly (this fork — SSE on 0.0.0.0:8000 by default)
+uv run python -m mac_messages_mcp.server
+
+# Or, if you've installed the upstream PyPI package:
 mac-messages-mcp
 ```
+
+### HTTP attachment endpoints (fork-only)
+
+When running in SSE mode the server also exposes plain-HTTP routes for
+attachment transfer alongside `/sse`:
+
+| Method | Path                  | Purpose                                  |
+| ------ | --------------------- | ---------------------------------------- |
+| `GET`  | `/attachments/{id}`   | Download an attachment by Messages DB id |
+| `POST` | `/attachments/send`   | Chunked upload + send to the locked chat |
+
+`tool_get_recent_messages` includes a `download_url` per attachment that
+resolves against the server's real LAN IP, so MCP clients can fetch
+attachments directly without going through the MCP transport.
 
 ## Development
 
