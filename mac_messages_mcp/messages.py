@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,44 +42,96 @@ def run_applescript(script: str) -> str:
 
 def get_chat_mapping() -> Dict[str, str]:
     """
-    Get mapping from room_name to display_name in chat table
+    Get mapping from room_name to display_name in chat table.
+
+    Returns an empty dict if the database is inaccessible or locked.
     """
-    conn = sqlite3.connect(get_messages_db_path())
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT room_name, display_name FROM chat")
-    result_set = cursor.fetchall()
-
-    mapping = {room_name: display_name for room_name, display_name in result_set}
-
-    conn.close()
-
-    return mapping
+    conn = None
+    try:
+        conn = sqlite3.connect(get_messages_db_path())
+        cursor = conn.cursor()
+        cursor.execute("SELECT room_name, display_name FROM chat")
+        result_set = cursor.fetchall()
+        return {room_name: display_name for room_name, display_name in result_set}
+    except Exception as e:
+        print(f"Error reading chat mapping: {e}")
+        return {}
+    finally:
+        if conn:
+            conn.close()
 
 def extract_body_from_attributed(attributed_body):
     """
-    Extract message content from attributedBody binary data
+    Extract message content from attributedBody binary data.
+
+    The attributedBody column contains an Apple typedstream blob
+    (NSArchiver serialization of NSMutableAttributedString).  The string
+    content is stored after the first ``NSString`` class marker followed
+    by a 5-byte header (``\\x01 <byte> \\x84 \\x01 +``) and a
+    variable-length integer encoding the byte length of the UTF-8 text.
+
+    Length encoding (first byte after the header):
+        < 0x80  — the byte *is* the length.
+        0x81    — next 2 bytes (little-endian) are the length.
+        0x82    — next 3 bytes (little-endian) are the length.
+        0x83    — next 4 bytes (little-endian) are the length.
     """
     if attributed_body is None:
         return None
-        
+
     try:
-        # Try to decode attributedBody 
-        decoded = attributed_body.decode('utf-8', errors='replace')
-        
-        # Extract content using pattern matching
-        if "NSNumber" in decoded:
-            decoded = decoded.split("NSNumber")[0]
-            if "NSString" in decoded:
-                decoded = decoded.split("NSString")[1]
-                if "NSDictionary" in decoded:
-                    decoded = decoded.split("NSDictionary")[0]
-                    decoded = decoded[6:-12]
-                    return decoded
-    except Exception as e:
-        print(f"Error extracting from attributedBody: {e}")
-    
-    return None
+        # Locate the first NSString class reference in the blob.
+        marker = b"NSString"
+        idx = attributed_body.find(marker)
+        if idx < 0:
+            return None
+
+        # Skip past: NSString (8) + \x01 + <byte> + \x84 + \x01 + '+' = 5 bytes
+        pos = idx + len(marker) + 5
+
+        if pos >= len(attributed_body):
+            return None
+
+        # Read the variable-length integer for the text byte count.
+        length_byte = attributed_body[pos]
+        pos += 1
+
+        if length_byte < 0x80:
+            text_length = length_byte
+        elif length_byte == 0x81:
+            if pos + 2 > len(attributed_body):
+                return None
+            text_length = attributed_body[pos] | (attributed_body[pos + 1] << 8)
+            pos += 2
+        elif length_byte == 0x82:
+            if pos + 3 > len(attributed_body):
+                return None
+            text_length = (
+                attributed_body[pos]
+                | (attributed_body[pos + 1] << 8)
+                | (attributed_body[pos + 2] << 16)
+            )
+            pos += 3
+        elif length_byte == 0x83:
+            if pos + 4 > len(attributed_body):
+                return None
+            text_length = (
+                attributed_body[pos]
+                | (attributed_body[pos + 1] << 8)
+                | (attributed_body[pos + 2] << 16)
+                | (attributed_body[pos + 3] << 24)
+            )
+            pos += 4
+        else:
+            return None
+
+        if pos + text_length > len(attributed_body):
+            return None
+
+        return attributed_body[pos : pos + text_length].decode("utf-8", errors="replace")
+
+    except Exception:
+        return None
 
 
 def get_messages_db_path() -> str:
@@ -224,9 +277,13 @@ def query_addressbook_db(query: str, params: tuple = ()) -> List[Dict[str, Any]]
     try:
         # Find the AddressBook database paths
         home_dir = os.path.expanduser("~")
+        # Check both the top-level DB and source-specific DBs (iCloud, Google, Exchange, etc.)
+        toplevel_path = os.path.join(home_dir, "Library/Application Support/AddressBook/AddressBook-v22.abcddb")
         sources_path = os.path.join(home_dir, "Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb")
         db_paths = glob.glob(sources_path)
-        
+        if os.path.exists(toplevel_path):
+            db_paths.append(toplevel_path)
+
         if not db_paths:
             return [{"error": f"AddressBook database not found at {sources_path} PLEASE TELL THE USER TO GRANT FULL DISK ACCESS TO THE TERMINAL APPLICATION(CURSOR, TERMINAL, CLAUDE, ETC.) AND RESTART THE APPLICATION. DO NOT RETRY UNTIL NEXT MESSAGE."}]
         
@@ -261,7 +318,7 @@ def get_addressbook_contacts() -> Dict[str, str]:
     contacts_map = {}
     
     # Define the query to get contact names, nicknames, and phone numbers
-    query = """
+    phone_query = """
     SELECT
         ZABCDRECORD.ZFIRSTNAME as first_name,
         ZABCDRECORD.ZLASTNAME as last_name,
@@ -277,7 +334,24 @@ def get_addressbook_contacts() -> Dict[str, str]:
         ZABCDRECORD.ZFIRSTNAME,
         ZABCDPHONENUMBER.ZORDERINGINDEX ASC
     """
-    
+
+    # Query for email-based contacts (used by iMessage when handle is an email)
+    email_query = """
+    SELECT
+        ZABCDRECORD.ZFIRSTNAME as first_name,
+        ZABCDRECORD.ZLASTNAME as last_name,
+        ZABCDRECORD.ZNICKNAME as nickname,
+        ZABCDEMAILADDRESS.ZADDRESS as email
+    FROM
+        ZABCDRECORD
+        LEFT JOIN ZABCDEMAILADDRESS ON ZABCDRECORD.Z_PK = ZABCDEMAILADDRESS.ZOWNER
+    WHERE
+        ZABCDEMAILADDRESS.ZADDRESS IS NOT NULL
+    ORDER BY
+        ZABCDRECORD.ZLASTNAME,
+        ZABCDRECORD.ZFIRSTNAME
+    """
+
     try:
         # For testing/fallback, parse the user-provided examples in cases where direct DB access fails
         # This is a temporary workaround until full disk access is granted
@@ -286,15 +360,20 @@ def get_addressbook_contacts() -> Dict[str, str]:
                 {"first_name":"TEST", "last_name":"TEST", "phone":"+11111111111"}
             ]
             return process_contacts(contacts)
-        
+
         # Try to query database directly
-        results = query_addressbook_db(query)
-        
+        results = query_addressbook_db(phone_query)
+
         if results and "error" in results[0]:
             print(f"Error getting AddressBook contacts: {results[0]['error']}")
             # Fall back to subprocess method if direct DB access fails
             return get_addressbook_contacts_subprocess()
-        
+
+        # Also query email addresses for email-based iMessage handles
+        email_results = query_addressbook_db(email_query)
+        if email_results and not (len(email_results) > 0 and "error" in email_results[0]):
+            results.extend(email_results)
+
         return process_contacts(results)
     except Exception as e:
         print(f"Error getting AddressBook contacts: {str(e)}")
@@ -312,6 +391,29 @@ def process_contacts(contacts) -> Dict[str, str]:
             last_name = contact.get("last_name", "") or ""
             nickname = contact.get("nickname", "") or ""
             phone = contact.get("phone", "")
+            email = contact.get("email", "")
+
+            # Create full name
+            full_name = " ".join(filter(None, [first_name, last_name]))
+            if not full_name.strip():
+                continue
+
+            # Handle email-based contacts (iMessage handles can be email addresses)
+            if email and not phone:
+                email_lower = email.strip().lower()
+                contacts_map[email_lower] = full_name
+
+                phone_to_details[email_lower] = {
+                    "first_name": first_name.strip(),
+                    "last_name": last_name.strip(),
+                    "nickname": nickname.strip(),
+                    "full_name": full_name
+                }
+
+                if full_name not in name_to_numbers:
+                    name_to_numbers[full_name] = []
+                name_to_numbers[full_name].append(email_lower)
+                continue
 
             # Skip entries without phone numbers
             if not phone:
@@ -320,11 +422,6 @@ def process_contacts(contacts) -> Dict[str, str]:
             # Clean up phone number and remove any image metadata
             if "X-IMAGETYPE" in phone:
                 phone = phone.split("X-IMAGETYPE")[0]
-
-            # Create full name
-            full_name = " ".join(filter(None, [first_name, last_name]))
-            if not full_name.strip():
-                continue
 
             # Normalize phone number and add to map
             normalized_phone = normalize_phone_number(phone)
@@ -570,39 +667,51 @@ def _send_message_to_recipient(recipient: str, message: str, contact_name: str =
     Returns:
         Success or error message
     """
+    file_path = None
     try:
-        # Create a temporary file with the message content
-        file_path = os.path.abspath('imessage_tmp.txt')
-        
-        with open(file_path, 'w') as f:
-            f.write(message)
-        
+        # Create a unique temporary file with the message content
+        tmp = tempfile.NamedTemporaryFile(suffix='.txt', delete=False)
+        file_path = tmp.name
+        try:
+            tmp.write(message.encode('utf-8'))
+        finally:
+            tmp.close()
+
+        # Sanitize the recipient/chat-id before embedding it in AppleScript.
+        # Upstream's `safe_recipient` was referenced here but never defined
+        # inside this function — every call would NameError and fall through
+        # to `_send_message_direct`. Define it locally to combine upstream's
+        # injection-hardening with our `chat id` group-chat fix.
+        safe_recipient = recipient.replace('\\', '\\\\').replace('"', '\\"')
+
         # Adjust the AppleScript command based on whether this is a group chat
         if not group_chat:
-            command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to participant "{recipient}" of (1st service whose service type = iMessage)'
+            command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to participant "{safe_recipient}" of (1st service whose service type = iMessage)'
         else:
-            command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to chat id "{recipient}"'
-        
+            # `chat id` (not `chat`) is required for reliable group-chat sends.
+            command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to chat id "{safe_recipient}"'
+
         # Run the AppleScript
         result = run_applescript(command)
-        
-        # Clean up the temporary file
-        try:
-            os.remove(file_path)
-        except:
-            pass
-        
+
         # Check result
         if result.startswith("Error:"):
             # Try fallback to direct method
             return _send_message_direct(recipient, message, contact_name, group_chat)
-        
+
         # Message sent successfully
         display_name = contact_name if contact_name else recipient
         return f"Message sent successfully to {display_name}"
     except Exception as e:
         # Try fallback method
         return _send_message_direct(recipient, message, contact_name, group_chat)
+    finally:
+        # Clean up the temporary file
+        if file_path:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
 def get_contact_name(handle_id: int) -> str:
     """
@@ -624,21 +733,28 @@ def get_contact_name(handle_id: int) -> str:
     
     # Try to match with AddressBook contacts
     contacts = get_cached_contacts()
-    normalized_handle = normalize_phone_number(handle_id_value)
-    
-    # Try different variations of the number for matching
-    if normalized_handle in contacts:
-        return contacts[normalized_handle]
-    
-    # Sometimes numbers in the addressbook have the country code, but messages don't
-    if normalized_handle.startswith('1') and len(normalized_handle) > 10:
-        # Try without country code
-        if normalized_handle[1:] in contacts:
-            return contacts[normalized_handle[1:]]
-    elif len(normalized_handle) == 10:  # US number without country code
-        # Try with country code
-        if '1' + normalized_handle in contacts:
-            return contacts['1' + normalized_handle]
+
+    # Check if handle is an email address (contains @ and no leading +)
+    if '@' in handle_id_value:
+        email_lower = handle_id_value.strip().lower()
+        if email_lower in contacts:
+            return contacts[email_lower]
+    else:
+        normalized_handle = normalize_phone_number(handle_id_value)
+
+        # Try different variations of the number for matching
+        if normalized_handle in contacts:
+            return contacts[normalized_handle]
+
+        # Sometimes numbers in the addressbook have the country code, but messages don't
+        if normalized_handle.startswith('1') and len(normalized_handle) > 10:
+            # Try without country code
+            if normalized_handle[1:] in contacts:
+                return contacts[normalized_handle[1:]]
+        elif len(normalized_handle) == 10:  # US number without country code
+            # Try with country code
+            if '1' + normalized_handle in contacts:
+                return contacts['1' + normalized_handle]
     
     # If no match found in AddressBook, fall back to display name from chat
     contact_query = """
@@ -842,19 +958,18 @@ def get_recent_messages(hours: int = 24, contact: Optional[str] = None) -> str:
         
         # Convert Apple timestamp to readable date
         try:
-            # Convert Apple timestamp to datetime
-            date_string = '2001-01-01'
-            mod_date = datetime.strptime(date_string, '%Y-%m-%d')
-            unix_timestamp = int(mod_date.timestamp()) * 1000000000
-            
+            apple_epoch_offset = 978307200  # Seconds between Unix epoch and Apple epoch (2001-01-01 UTC)
+
             # Handle both nanosecond and second format timestamps
             msg_timestamp = int(msg["date"])
-            if len(str(msg_timestamp)) > 10:  # It's in nanoseconds
-                new_date = int((msg_timestamp + unix_timestamp) / 1000000000)
-            else:  # It's already in seconds
-                new_date = mod_date.timestamp() + msg_timestamp
-                
-            date_str = datetime.fromtimestamp(new_date).strftime("%Y-%m-%d %H:%M:%S")
+            msg_timestamp_s = (
+                msg_timestamp / 1_000_000_000
+                if len(str(msg_timestamp)) > 10
+                else msg_timestamp
+            )
+
+            date_val = datetime.fromtimestamp(msg_timestamp_s + apple_epoch_offset, tz=timezone.utc)
+            date_str = date_val.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         except (ValueError, TypeError, OverflowError) as e:
             # If conversion fails, use a placeholder
             date_str = "Unknown date"
@@ -1153,9 +1268,9 @@ def _send_message_direct(
     Returns:
         Success or error message with service type used
     """
-    # Clean the inputs for AppleScript
-    safe_message = message.replace('"', '\\"').replace('\\', '\\\\')
-    safe_recipient = recipient.replace('"', '\\"')
+    # Clean the inputs for AppleScript (escape backslashes first, then quotes)
+    safe_message = message.replace('\\', '\\\\').replace('"', '\\"')
+    safe_recipient = recipient.replace('\\', '\\\\').replace('"', '\\"')
     
     # For group chats, stick to iMessage only (SMS doesn't support group chats well)
     if group_chat:

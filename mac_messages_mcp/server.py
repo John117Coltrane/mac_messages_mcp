@@ -216,9 +216,11 @@ def _get_chat_guid(chat_identifier: str) -> str:
 
 # ── MCP Server ───────────────────────────────────────────────────────────────
 
+# Note: FastMCP's `description=` keyword was renamed to `instructions=` upstream
+# (PR #28, FastMCP API compatibility). Use `instructions=` for forward compat.
 mcp = FastMCP(
     "MessageBridge",
-    description="A bridge for interacting with a single allowed iMessage group chat",
+    instructions="A bridge for interacting with a configurable allow list of iMessage chats",
 )
 
 

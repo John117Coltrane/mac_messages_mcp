@@ -287,7 +287,7 @@ dev = [
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.10.0" },
-    { name = "mcp", extras = ["cli"] },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.2.0,<2.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "python-levenshtein", specifier = ">=0.23.0" },
