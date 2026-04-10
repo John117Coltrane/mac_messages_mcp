@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`tool_send_tapback` and `tool_send_reply` MCP tools** wired up against
+  the `ui_automation` helper module. These let MCP clients send tapback
+  reactions (standard names + arbitrary emoji) and threaded replies on
+  specific messages, identified by `msg_id` from `tool_get_recent_messages`.
+  Both tools accept the same optional `chat_identifier` as the rest of the
+  send tools, and look up the chat's `display_name` from the database to
+  drive Messages.app UI navigation. Requires Accessibility permission.
+- **`_get_chat_display_name(chat_identifier)`** helper in `server.py` for
+  the identifier → display-name lookup the UI automation helpers need.
+- **Merged upstream `carterlasalle/main`** (17 commits) into the fork.
+  Brings in the AppleScript injection sanitization, timestamp timezone
+  fix, tempfile race-condition fix, `get_chat_mapping()` error handling,
+  attributedBody typedstream decoder + tests, contact resolution fix for
+  email handles, and FastMCP API compatibility (`description=` →
+  `instructions=`). Also caught and fixed an upstream `NameError` bug:
+  `_send_message_to_recipient` referenced `safe_recipient` without
+  defining it inside the function — every call would crash and silently
+  fall through to `_send_message_direct`. The file-based group send path
+  now actually works.
+
 - **Multi-chat allow list.** `allowed_chat_id` is now polymorphic and accepts:
   - a single string (current single-chat behavior, fully back-compat)
   - `"*"` to allow all chats — single-chat lockdown is then explicitly

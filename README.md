@@ -51,11 +51,18 @@ See the [Integration section](#integration) below for setup instructions.
 - **`tool_get_new_messages`**: server-side high-water mark for incremental
   polling.
 - **`tool_list_chats`**: discover chat identifiers during initial setup.
-- **`ui_automation` helper module**: tapback reactions (standard names + any
-  emoji), threaded replies, multi-attachment sends, and image-with-caption.
-  Drives Messages.app via System Events / Accessibility. Currently a Python
-  helper module — not yet wired as MCP tools. Requires Accessibility
-  permission for the terminal app or `osascript`.
+- **`tool_send_tapback` MCP tool**: react to a specific message with one of
+  the standard tapbacks (`love`, `like`, `dislike`, `laugh`, `emphasis`,
+  `question`) or any emoji character. Targets a message by `msg_id` from
+  `tool_get_recent_messages`. Requires Accessibility permission.
+- **`tool_send_reply` MCP tool**: send a threaded reply to a specific
+  message. Targets the same way as tapbacks. Requires Accessibility permission.
+- **`ui_automation` helper module** (Python-only): in addition to the two
+  tools above, exposes `send_multiple_attachments(chat_guid, file_paths)`
+  and `send_image_with_caption(chat_guid, file_path, caption)` for
+  server-side scripting. These take server-local file paths and are
+  intentionally not wired as MCP tools — clients should use
+  `tool_send_attachment` (chunked base64 upload) instead.
 
 ### Inherited from upstream
 - **Universal Message Sending**: Automatically sends via iMessage or SMS/RCS based on recipient availability

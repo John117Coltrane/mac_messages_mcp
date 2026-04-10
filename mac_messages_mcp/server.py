@@ -214,6 +214,22 @@ def _get_chat_guid(chat_identifier: str) -> str:
     return chat_identifier
 
 
+def _get_chat_display_name(chat_identifier: str) -> str | None:
+    """Look up the display name for a chat_identifier (used for UI navigation).
+
+    Returns None if the chat has no display name. The ui_automation helpers
+    use this to drive Cmd+F search in Messages.app.
+    """
+    results = query_messages_db(
+        "SELECT display_name FROM chat WHERE chat_identifier = ? LIMIT 1",
+        (chat_identifier,),
+    )
+    if results and "error" not in results[0]:
+        name = results[0].get("display_name")
+        return name if name else None
+    return None
+
+
 # ── MCP Server ───────────────────────────────────────────────────────────────
 
 # Note: FastMCP's `description=` keyword was renamed to `instructions=` upstream
@@ -812,6 +828,109 @@ def tool_send_attachment(
     except Exception as e:
         logger.error(f"Error sending attachment: {e}")
         return json.dumps({"error": str(e)})
+
+
+# ── UI automation tools (tapbacks, threaded replies) ────────────────────────
+#
+# These drive Messages.app via System Events / Accessibility because the
+# standard AppleScript `send` command can't perform reactions or replies.
+# Requires Accessibility access for the terminal app or osascript.
+
+
+@mcp.tool()
+def tool_send_tapback(
+    ctx: Context,
+    message_rowid: int,
+    tapback_type: str,
+    chat_identifier: str = "",
+) -> str:
+    """
+    Send a tapback reaction to a specific message via Messages.app UI automation.
+
+    Requires Accessibility permission. Run `tool_check_db_access` first if
+    you're unsure whether the server has the access it needs.
+
+    Args:
+        message_rowid: The ROWID (msg_id in tool_get_recent_messages output)
+            of the target message.
+        tapback_type: Either a standard name — one of "love", "like", "dislike",
+            "laugh", "emphasis", "question" — OR an emoji character (e.g. "🖤", "🤔").
+        chat_identifier: Target chat. Optional when exactly one chat is allowed.
+            Required when multiple chats are allowed or when allowed_chat_id='*'.
+    """
+    if err := _require_allowed_chat():
+        return err
+
+    target, target_err = _resolve_target_chat(chat_identifier or None)
+    if target_err:
+        return target_err
+
+    display_name = _get_chat_display_name(target)
+    if not display_name:
+        return (
+            f"Error: chat {target} has no display_name in the Messages database. "
+            "UI automation needs a display name to navigate to the chat."
+        )
+
+    from mac_messages_mcp.ui_automation import send_tapback as _send_tapback
+    logger.info(f"Sending tapback {tapback_type!r} on message {message_rowid} in chat {target}")
+    try:
+        return _send_tapback(
+            chat_identifier=target,
+            chat_display_name=display_name,
+            message_rowid=message_rowid,
+            tapback_type=tapback_type,
+        )
+    except Exception as e:
+        logger.error(f"Error in tool_send_tapback: {e}")
+        return f"Error sending tapback: {str(e)}"
+
+
+@mcp.tool()
+def tool_send_reply(
+    ctx: Context,
+    message_rowid: int,
+    reply_text: str,
+    chat_identifier: str = "",
+) -> str:
+    """
+    Send a threaded reply to a specific message via Messages.app UI automation.
+
+    Requires Accessibility permission.
+
+    Args:
+        message_rowid: The ROWID (msg_id in tool_get_recent_messages output)
+            of the message to reply to.
+        reply_text: The reply text to send.
+        chat_identifier: Target chat. Optional when exactly one chat is allowed.
+            Required when multiple chats are allowed or when allowed_chat_id='*'.
+    """
+    if err := _require_allowed_chat():
+        return err
+
+    target, target_err = _resolve_target_chat(chat_identifier or None)
+    if target_err:
+        return target_err
+
+    display_name = _get_chat_display_name(target)
+    if not display_name:
+        return (
+            f"Error: chat {target} has no display_name in the Messages database. "
+            "UI automation needs a display name to navigate to the chat."
+        )
+
+    from mac_messages_mcp.ui_automation import send_reply as _send_reply
+    logger.info(f"Sending reply to message {message_rowid} in chat {target}")
+    try:
+        return _send_reply(
+            chat_identifier=target,
+            chat_display_name=display_name,
+            message_rowid=message_rowid,
+            reply_text=reply_text,
+        )
+    except Exception as e:
+        logger.error(f"Error in tool_send_reply: {e}")
+        return f"Error sending reply: {str(e)}"
 
 
 # ── Diagnostics ──────────────────────────────────────────────────────────────
