@@ -63,5 +63,34 @@ venv.bak/
 # macOS
 .DS_Store
 
-# Local config (contains user-specific chat ID)
-config.json 
+# Local config (contains user-specific chat ID, secrets)
+config.json
+config.local.json
+config.*.local.json
+*.secret.json
+*.secrets.json
+secrets/
+.secrets/
+
+# Anything with "private" or "local" in the name (defensive)
+*.private.*
+*.local.*
+
+# Credentials, tokens, keys
+*.pem
+*.key
+*.crt
+*.p12
+.env.*
+!.env.example
+credentials.json
+service-account*.json
+
+# Backups that might contain copies of config
+*.bak
+*.backup
+*.orig
+
+# OS / editor scratch
+.DS_Store
+*~
