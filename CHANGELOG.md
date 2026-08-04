@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Bearer token authentication for the SSE server.** Set `auth_token` in
+  `config.json` (or `MCP_AUTH_TOKEN`) to require `Authorization: Bearer
+  <token>` on every SSE/HTTP request; unauthenticated/mismatched requests
+  get `401`. Previously the server had no auth at all when bound beyond
+  `127.0.0.1`. Documented the recommended split between the human's server
+  auth token and the bot Apple ID Messages.app is signed into.
 - **`tool_send_tapback` and `tool_send_reply` MCP tools** wired up against
   the `ui_automation` helper module. These let MCP clients send tapback
   reactions (standard names + arbitrary emoji) and threaded replies on

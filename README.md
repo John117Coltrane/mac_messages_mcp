@@ -176,9 +176,73 @@ Take precedence over `config.json`:
 | `MCP_TRANSPORT`     | `stdio` or `sse` (default `stdio` upstream, `sse` in this fork) |
 | `MCP_HOST`          | Bind host (default `0.0.0.0`)                                  |
 | `MCP_PORT`          | Bind port (default `8000`)                                     |
+| `MCP_AUTH_TOKEN`    | Bearer token required on every SSE/HTTP request (see [Authentication](#authentication)) |
 | `CHUNK_SIZE_BYTES`  | Chunk size for attachment transfers (default 524288)           |
 
-`config.json` is gitignored — keep your chat IDs out of source control.
+`config.json` is gitignored — keep your chat IDs and auth token out of source control.
+
+## Authentication
+
+The SSE transport binds `0.0.0.0` by default and, out of the box, has **no
+auth** — anyone who can reach `host:port` can read and send messages as
+whatever Apple ID is signed into Messages.app. Set `auth_token` in
+`config.json` (or `MCP_AUTH_TOKEN`) to require every request — the SSE
+connection, the `/messages/` POST channel, and both `/attachments/*` routes —
+to send `Authorization: Bearer <token>`. Requests without a matching token
+get `401 Unauthorized`. If `auth_token` is left blank, the server logs a
+warning at startup and stays open; that's fine for `127.0.0.1`-only setups
+but not for anything reachable over LAN/Tailscale/etc.
+
+```json
+{
+  "auth_token": "a-long-random-string-only-you-know"
+}
+```
+
+Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+Configure your MCP client to send that token as a header, e.g. for a
+`mcp.json`-style remote server entry:
+
+```json
+{
+  "mcpServers": {
+    "messages": {
+      "url": "http://your-mac.local:8000/sse",
+      "headers": { "Authorization": "Bearer a-long-random-string-only-you-know" }
+    }
+  }
+}
+```
+
+### Separating your login from the bot's iMessage account
+
+`auth_token` controls **who is allowed to talk to the server** — that's the
+credential you personally hold. It's independent from **which Apple ID
+Messages.app is signed into** on the Mac, which is what actually sends and
+receives the iMessages. Recommended split, so a compromised/shared server
+token never exposes your personal iMessage history:
+
+1. **Dedicated Apple ID for Messages.app.** Sign Messages.app into a bot
+   account (e.g. `bot@apple.com`) instead of your personal Apple ID. All
+   `tool_send_message`/`tool_get_recent_messages`/etc. traffic then reads and
+   sends as that bot identity, scoped further by `allowed_chat_id`.
+2. **Best isolation: a separate standard macOS user account.** Create a
+   second, non-admin macOS user on the same Mac, sign in there, sign
+   Messages.app into the bot Apple ID, grant *that* user's Terminal Full
+   Disk Access + Accessibility (see [Prerequisites](#prerequisites)), and run
+   `uv run python -m mac_messages_mcp.server` under that login (fast user
+   switching, `launchd` agent, or `ssh`'d in). This keeps the bot's
+   `chat.db`, contacts, and Messages state fully separate from your own
+   login — you never have to log out of your own account to manage it.
+   A single shared macOS login with Messages.app just signed into the bot
+   Apple ID also works and is simpler, but your personal login session and
+   the bot's message history then live in the same user account.
+3. **Your own login stays out of it.** You never authenticate to the Mac
+   itself to use the bridge day-to-day — you connect to the SSE server
+   remotely from wherever your MCP client runs, presenting your
+   `auth_token`. The server process (running as the bot's macOS user) is
+   the only thing that needs to be logged into the Mac locally, and only to
+   keep Messages.app open and the server running.
 
 ## Integration
 
@@ -262,7 +326,7 @@ npx mcp-proxy uvx mac-messages-mcp --port 8001 --host 0.0.0.0
 npx mcp-proxy uvx another-mcp-server --port 8002 --host 0.0.0.0
 ```
 
-**Note:** Binding to `0.0.0.0` exposes the service to all network interfaces. In production, consider using more restrictive host bindings and adding authentication.
+**Note:** Binding to `0.0.0.0` exposes the service to all network interfaces. Set `auth_token` (see [Authentication](#authentication)) before doing this, and consider a more restrictive host binding where possible.
 
 
 ### Install from source (this fork)
