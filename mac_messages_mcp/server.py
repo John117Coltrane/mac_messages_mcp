@@ -17,6 +17,7 @@ See config.example.json for the format.
 
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import mimetypes
@@ -30,6 +31,8 @@ import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
@@ -81,6 +84,7 @@ def _load_config() -> dict:
         "transport": os.environ.get("MCP_TRANSPORT", config.get("transport", "stdio")),
         "host": os.environ.get("MCP_HOST", config.get("host", "0.0.0.0")),
         "port": int(os.environ.get("MCP_PORT", config.get("port", 8000))),
+        "auth_token": os.environ.get("MCP_AUTH_TOKEN", config.get("auth_token", "")),
     }
 
 
@@ -115,6 +119,18 @@ def _parse_allowed_chats(raw: object) -> tuple[set[str], bool]:
 
 CONFIG = _load_config()
 ALLOWED_CHAT_IDS, ALLOW_ALL_CHATS = _parse_allowed_chats(CONFIG["allowed_chat_id_raw"])
+AUTH_TOKEN = (CONFIG.get("auth_token") or "").strip()
+
+if CONFIG["transport"] == "sse":
+    if AUTH_TOKEN:
+        logger.info("Bearer token authentication is enabled for the SSE server.")
+    else:
+        logger.warning(
+            "No auth_token configured — the SSE server is UNAUTHENTICATED. "
+            "Anyone who can reach host:port can read and send messages as the "
+            "Apple ID signed into Messages.app. Set auth_token in config.json "
+            "(or the MCP_AUTH_TOKEN env var) before exposing this beyond localhost."
+        )
 
 if ALLOW_ALL_CHATS:
     logger.warning(
@@ -1033,6 +1049,25 @@ async def handle_attachment_upload(request: Request) -> Response:
     })
 
 
+# ── Auth ─────────────────────────────────────────────────────────────────────
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Require `Authorization: Bearer <token>` on every request when auth_token
+    is configured. This is the credential a human/client uses to talk to the
+    server — separate from whatever Apple ID Messages.app is signed into."""
+
+    async def dispatch(self, request: Request, call_next):
+        if not AUTH_TOKEN:
+            return await call_next(request)
+
+        header = request.headers.get("authorization", "")
+        provided = header[7:] if header.lower().startswith("bearer ") else ""
+        if not provided or not hmac.compare_digest(provided, AUTH_TOKEN):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 
 
@@ -1078,6 +1113,7 @@ def run_server():
             Route("/attachments/send", endpoint=handle_attachment_upload, methods=["POST"]),
             Route("/attachments/{attachment_id:int}", endpoint=handle_attachment_download),
         ],
+        middleware=[Middleware(BearerAuthMiddleware)],
     )
 
     host = CONFIG.get("host", "0.0.0.0")
